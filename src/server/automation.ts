@@ -16,7 +16,7 @@ const CAPABILITY: Record<AutomationStep, string> = {
   idea_scout: 'idea_discovery', production: 'production', quality: 'quality', publishing: 'publishing',
 };
 
-export function policyBlocker(policy: AutomationPolicy, step: AutomationStep, shortsSinceReview: number, spentTodayMicrousd = 0): string | null {
+export function policyBlocker(policy: AutomationPolicy, step: AutomationStep, shortsSinceReview: number, spentTodayMicrousd = 0, reviewApproved = false): string | null {
   if (Boolean(policy.stop_switch)) return 'stop_switch_enabled';
   if (policy.mode !== 'assisted' && policy.mode !== 'autopilot') return 'automation_mode_invalid';
   if (!Array.isArray(policy.enabled_capabilities) || !policy.enabled_capabilities.includes(CAPABILITY[step])) return 'capability_disabled';
@@ -24,17 +24,23 @@ export function policyBlocker(policy: AutomationPolicy, step: AutomationStep, sh
   if (typeof policy.per_job_cost_limit !== 'number' || !Number.isFinite(policy.per_job_cost_limit) || policy.per_job_cost_limit <= 0) return 'job_cost_ceiling_required';
   if (!Number.isSafeInteger(spentTodayMicrousd) || spentTodayMicrousd < 0) return 'daily_cost_unavailable';
   if (spentTodayMicrousd >= Math.round(policy.daily_spend_limit * 1_000_000)) return 'daily_cost_ceiling_exceeded';
-  if (policy.mode === 'assisted' && step !== 'idea_scout') return 'assisted_review_required';
+  if (policy.mode === 'assisted' && step !== 'idea_scout' && !reviewApproved) return 'assisted_review_required';
   if (step === 'publishing') {
-    if (policy.review_mode === 'every_short') return 'review_required';
-    if (policy.review_mode === 'after_n_shorts') {
+    if (policy.review_mode === 'every_short') {
+      if (!reviewApproved) return 'review_required';
+    } else if (policy.review_mode === 'after_n_shorts') {
       const threshold = Number(policy.review_after_count);
       if (!Number.isSafeInteger(threshold) || threshold < 1) return 'review_threshold_invalid';
       if (!Number.isSafeInteger(shortsSinceReview) || shortsSinceReview < 0) return 'review_counter_invalid';
-      if (shortsSinceReview >= threshold) return 'review_required';
+      if (shortsSinceReview >= threshold && !reviewApproved) return 'review_required';
     } else if (policy.review_mode !== 'none') return 'review_mode_invalid';
   }
   return null;
+}
+
+export const MAX_AUTOMATION_ATTEMPTS = 5;
+export function retryableAutomationCode(code: string): boolean {
+  return ['platform_api_unavailable','provider_network_unavailable','network_timeout'].includes(code);
 }
 
 export function retryDelaySeconds(attempt: number, entropy = 0): number {

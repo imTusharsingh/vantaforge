@@ -92,11 +92,45 @@ BEGIN
   VALUES (NEW.workspace_id,1,1,NEW.published_at)
   ON CONFLICT(workspace_id) DO UPDATE SET shorts_since_review=shorts_since_review+1,version=version+1,updated_at=NEW.published_at;
 END;
-CREATE TRIGGER automation_reset_review_counter AFTER INSERT ON quality_gate_decisions
-WHEN NEW.decision = 'approved'
-BEGIN
-  INSERT INTO automation_review_counters (workspace_id,shorts_since_review,version,updated_at)
-  VALUES (NEW.workspace_id,0,1,NEW.created_at)
-  ON CONFLICT(workspace_id) DO UPDATE SET shorts_since_review=0,version=version+1,updated_at=NEW.created_at;
-END;
 
+CREATE TABLE automation_review_checkpoints (
+  id TEXT PRIMARY KEY NOT NULL,
+  run_id TEXT NOT NULL REFERENCES automation_runs(id) ON DELETE CASCADE,
+  step_id TEXT NOT NULL REFERENCES automation_run_steps(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('assisted','cadence')),
+  counter_version INTEGER,
+  threshold INTEGER,
+  shorts_reviewed INTEGER,
+  approved_by_user_id TEXT NOT NULL REFERENCES users(id),
+  reason TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE (run_id, step_id, kind, counter_version)
+);
+CREATE TRIGGER automation_review_checkpoints_no_update BEFORE UPDATE ON automation_review_checkpoints BEGIN SELECT RAISE(ABORT, 'immutable automation review checkpoint'); END;
+CREATE TRIGGER automation_review_checkpoints_no_delete BEFORE DELETE ON automation_review_checkpoints BEGIN SELECT RAISE(ABORT, 'immutable automation review checkpoint'); END;
+
+CREATE TABLE automation_budget_accounts (
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  budget_date TEXT NOT NULL,
+  limit_microusd INTEGER NOT NULL CHECK (limit_microusd > 0),
+  reserved_microusd INTEGER NOT NULL DEFAULT 0 CHECK (reserved_microusd >= 0),
+  actual_microusd INTEGER NOT NULL DEFAULT 0 CHECK (actual_microusd >= 0),
+  version INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, budget_date)
+);
+CREATE TABLE automation_budget_reservations (
+  id TEXT PRIMARY KEY NOT NULL,
+  run_id TEXT NOT NULL REFERENCES automation_runs(id) ON DELETE CASCADE,
+  step_id TEXT NOT NULL REFERENCES automation_run_steps(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  budget_date TEXT NOT NULL,
+  estimate_microusd INTEGER NOT NULL CHECK (estimate_microusd >= 0),
+  actual_microusd INTEGER,
+  status TEXT NOT NULL CHECK (status IN ('reserved','reconciled','released')),
+  created_at TEXT NOT NULL,
+  reconciled_at TEXT,
+  UNIQUE (step_id)
+);
+CREATE INDEX automation_budget_reservations_account_idx ON automation_budget_reservations(workspace_id,budget_date,status);

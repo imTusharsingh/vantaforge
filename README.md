@@ -111,9 +111,11 @@ boundary. Assisted mode pauses before autonomous downstream work; autopilot
 still requires enabled capabilities, positive daily/per-job ceilings, quality,
 provider/media availability, and configured review cadence. `after_n_shorts`
 uses a transactional counter incremented only by a real `published_posts`
-insert and reset by a real reviewer approval, so retries and replays cannot
-advance it. Current missing Idea Scout and render adapters therefore remain
-explicit terminal blockers rather than simulated success.
+insert. It resets only through a dedicated, immutable automation review
+checkpoint tied to the observed counter version and threshold; ordinary
+per-video quality approval does not affect cadence. Current missing Idea Scout
+and render adapters therefore remain explicit terminal blockers rather than
+simulated success.
 
 Authenticated endpoints:
 
@@ -122,6 +124,7 @@ Authenticated endpoints:
 - `GET /v1/workspaces/:id/automation-runs`
 - `GET /v1/automation-runs/:id`
 - `POST /v1/automation-runs/:id/cancel`
+- `POST /v1/automation-runs/:id/approve`
 
 Schedule control is owner/admin-only; active editors may cancel non-terminal
 runs. All visibility remains membership-scoped. Provider credentials remain

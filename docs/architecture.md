@@ -36,10 +36,19 @@ There is no scheduler-specific provider fallback.
 
 Review cadence is based on `automation_review_counters`, not a non-atomic query.
 The database increments the counter in the same transaction that inserts a real
-published post and resets it when an immutable approved quality decision is
-inserted. For an after-N policy, the next publish pauses once the counter is N
-or greater (including exact thresholds 10 and 20). Replays cannot double-count
-because `published_posts.publish_request_id` is unique.
+published post. A dedicated immutable automation review checkpoint captures the
+counter version, threshold, reviewed count, reviewer, and reason; a guarded D1
+batch resets that exact counter version and resumes the waiting run. Ordinary
+quality decisions never reset cadence. For an after-N policy, the next publish
+pauses once the counter is N or greater (including exact thresholds 10 and 20).
+Replays cannot double-count because `published_posts.publish_request_id` is
+unique.
+
+Before a potentially billable boundary, an atomic daily account reservation
+checks both the live daily ceiling and per-job estimate. Competing reservations
+use conditional updates. Completion reconciles the reservation with persisted
+provider cost evidence in the production ledger or Idea Scout cost record;
+fail-closed zero-cost boundaries release their reservation.
 
 Responses use `{ data, request_id }` or `{ error: { code, message, details }, request_id }`.
 Collections are cursor-paginated and always workspace-scoped.
