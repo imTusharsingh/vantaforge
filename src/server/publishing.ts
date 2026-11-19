@@ -1,5 +1,10 @@
 export type PublishingPlatform = "youtube" | "instagram";
 
+export const ANALYTICS_SCOPES: Record<PublishingPlatform, string[]> = {
+  youtube: ["https://www.googleapis.com/auth/yt-analytics.readonly"],
+  instagram: ["instagram_manage_insights"],
+};
+
 export const PLATFORM_RULES: Record<PublishingPlatform, {
   label: string;
   scopes: string[];
@@ -36,10 +41,10 @@ export function retryDelaySeconds(attempt: number): number {
 
 export function oauthAuthorizationUrl(platformId: PublishingPlatform, clientId: string, redirectUri: string, state: string, nonce: string): string {
   if (platformId === "youtube") {
-    const params = new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, response_type: "code", scope: PLATFORM_RULES.youtube.scopes.join(" "), access_type: "offline", prompt: "consent", state });
+    const params = new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, response_type: "code", scope: [...PLATFORM_RULES.youtube.scopes, ...ANALYTICS_SCOPES.youtube].join(" "), access_type: "offline", prompt: "consent", state });
     return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
   }
-  const params = new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, response_type: "code", scope: PLATFORM_RULES.instagram.scopes.join(","), state, nonce });
+  const params = new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, response_type: "code", scope: [...PLATFORM_RULES.instagram.scopes, ...ANALYTICS_SCOPES.instagram].join(","), state, nonce });
   return `https://www.facebook.com/v21.0/dialog/oauth?${params}`;
 }
 
