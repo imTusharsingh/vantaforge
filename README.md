@@ -71,10 +71,10 @@ an explicit assisted-mode policy, with no mock data or AI fallback involved.
 Local verification:
 
 ```sh
-npm install
-npm run check
-npx wrangler d1 migrations apply vantaforge --local
-npx wrangler dev
+pnpm install
+pnpm run check
+pnpm exec wrangler d1 migrations apply vantaforge --local
+pnpm exec wrangler dev
 ```
 
 ## AI provider settings
@@ -83,7 +83,7 @@ Provider credentials are workspace-scoped and write-only. Before using these
 routes, configure the dedicated encryption secret with Wrangler:
 
 ```sh
-npx wrangler secret put CREDENTIAL_ENCRYPTION_KEY
+pnpm exec wrangler secret put CREDENTIAL_ENCRYPTION_KEY
 ```
 
 This is an encryption key for VantaForge, not an AI provider key. Users submit
@@ -131,7 +131,7 @@ an AI provider key and must not be placed in source control or ordinary
 configuration:
 
 ```sh
-npx wrangler secret put CREDENTIAL_ENCRYPTION_KEY
+pnpm exec wrangler secret put CREDENTIAL_ENCRYPTION_KEY
 ```
 
 The value must be a 32-byte base64 secret or a 64-character hexadecimal
