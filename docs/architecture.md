@@ -58,6 +58,20 @@ Assets become usable only after upload, checksum verification, malware scan,
 metadata extraction, and licensing checks. Private storage keys are never
 returned; downloads use short-lived authorized URLs.
 
+The implemented asset boundary uses an R2 binding named `ASSETS` and D1
+migration `0003_assets.sql`. Upload intents persist a hashed, expiring token and
+return only an opaque Worker upload URL. The Worker verifies video media type
+and byte count, hashes uploaded bytes, and requires the same checksum plus a
+positive duration and licensing/rights metadata on completion. List/get routes
+expose metadata and references only; the download route authorizes active
+membership and streams the private object without revealing its key.
+
+`scan_status`, `licensing_status`, and overall `status` are explicit state
+fields. No malware scanner is configured in this slice, so completion sets
+`scan_status=unavailable`, `status=blocked`, and
+`blocked_reason=malware_scanner_unavailable`. The asset cannot become ready or
+downloadable until a real scanner integration changes that state.
+
 ### Idea Scout
 
 ```text
@@ -222,7 +236,7 @@ use IDs and immutable snapshots, never shared provider secrets.
 | Boundary | Example endpoints | Contract |
 | --- | --- | --- |
 | Identity/workspaces | `GET /v1/me`; `POST /v1/workspaces`; `GET /v1/workspaces/{id}/members`; `PATCH /v1/workspaces/{id}/automation-policy` | Membership, roles, policy, audit |
-| Assets | `POST /v1/workspaces/{id}/assets/uploads`; `POST /v1/assets/{id}/scan`; `GET /v1/workspaces/{id}/assets` | Storage, scanning, licensing, readiness |
+| Assets | `POST /v1/workspaces/{id}/assets/uploads`; `PUT /v1/assets/uploads/{id}/content`; `POST /v1/assets/{id}/complete`; `GET /v1/workspaces/{id}/assets`; `GET /v1/assets/{id}`; `GET /v1/assets/{id}/download` | Private R2 storage, scanning state, licensing, readiness |
 | Idea Scout | `POST /v1/workspaces/{id}/idea-runs`; `GET /v1/idea-runs/{id}`; `POST /v1/ideas/{id}/approve`; `POST /v1/briefs` | Evidence-backed candidates and approved briefs |
 | Production | `POST /v1/workspaces/{id}/production-jobs`; `GET /v1/production-jobs/{id}`; `POST /v1/production-jobs/{id}/cancel` | Plan, render, cost ledger, job state |
 | Quality Gate | `POST /v1/production-jobs/{id}/quality-gate`; `GET /v1/quality-gates/{id}`; `POST /v1/quality-gates/{id}/decision` | Checks, findings, policy/human decision |

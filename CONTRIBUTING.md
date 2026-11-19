@@ -5,7 +5,7 @@
 Run:
 
 ```sh
-pnpm install
+pnpm install --frozen-lockfile
 pnpm run check
 git diff --check
 ```

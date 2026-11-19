@@ -8,5 +8,10 @@ database_name = "vantaforge"
 database_id = "replace-with-your-d1-database-id"
 migrations_dir = "src/server/migrations"
 
+[[r2_buckets]]
+binding = "ASSETS"
+bucket_name = "vantaforge-assets"
+# For local development, Wrangler provisions an isolated local R2 bucket.
+
 # Runtime secret binding; this is an encryption key, never an AI provider key.
-# Configure with: npx wrangler secret put CREDENTIAL_ENCRYPTION_KEY
+# Configure with: pnpm exec wrangler secret put CREDENTIAL_ENCRYPTION_KEY

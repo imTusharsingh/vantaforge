@@ -2,14 +2,14 @@
   "name": "vantaforge",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@11.7.0",
   "scripts": {
     "check": "tsc --noEmit",
     "test": "node --test"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20261119.1",
-    "typescript": "^5.9.3",
-    "wrangler": "^4.49.1"
-  }
+    "@cloudflare/workers-types": "4.20251118.0",
+    "typescript": "5.9.3",
+    "wrangler": "4.49.1"
+  },
+  "packageManager": "pnpm@11.7.0"
 }
