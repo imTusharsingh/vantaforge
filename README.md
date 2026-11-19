@@ -95,6 +95,38 @@ pnpm exec wrangler d1 migrations apply vantaforge --local
 pnpm exec wrangler dev
 ```
 
+## Durable automation scheduler
+
+Migration [`0010_automation_scheduler.sql`](./src/server/migrations/0010_automation_scheduler.sql)
+adds workspace-scoped schedules, runs, ordered steps, immutable events, leases,
+retry timing, cancellation, terminal blockers, and durable review counters. A
+Cloudflare Cron Trigger invokes the worker every five minutes; set
+`AUTOMATION_SCHEDULER_ENABLED=true` only where that trigger is actually
+deployed. Without it, newly created schedules persist as `blocked` with
+`scheduler_unavailable` and no run is claimed.
+
+The scheduler re-reads the live policy and stop switch immediately before each
+Idea Scout, production, quality, or publishing boundary. It cannot skip a
+boundary. Assisted mode pauses before autonomous downstream work; autopilot
+still requires enabled capabilities, positive daily/per-job ceilings, quality,
+provider/media availability, and configured review cadence. `after_n_shorts`
+uses a transactional counter incremented only by a real `published_posts`
+insert and reset by a real reviewer approval, so retries and replays cannot
+advance it. Current missing Idea Scout and render adapters therefore remain
+explicit terminal blockers rather than simulated success.
+
+Authenticated endpoints:
+
+- `GET/POST /v1/workspaces/:id/automation-schedules`
+- `POST /v1/automation-schedules/:id/control` (`pause`, `resume`, `cancel`)
+- `GET /v1/workspaces/:id/automation-runs`
+- `GET /v1/automation-runs/:id`
+- `POST /v1/automation-runs/:id/cancel`
+
+Schedule control is owner/admin-only; active editors may cancel non-terminal
+runs. All visibility remains membership-scoped. Provider credentials remain
+user-owned and are never placed in scheduler configuration.
+
 ## AI provider settings
 
 Provider credentials are workspace-scoped and write-only. Before using these

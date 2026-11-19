@@ -18,6 +18,29 @@ synthetic analytics, fake provider responses, or silent local fallbacks.
   and responses, and decrypted only at the provider adapter boundary.
 - Retries re-run validation and policy gates and preserve the idempotency key.
 
+## Automation scheduler and autopilot
+
+The Cloudflare Cron Trigger is only a wake-up signal. D1 is the source of truth:
+`automation_schedules` determines due work, `automation_runs` and ordered
+`automation_run_steps` carry state and idempotency, and expiring compare-and-set
+leases recover abandoned workers. A schedule occurrence has a unique
+`(schedule_id, scheduled_for)` key; every boundary has a stable workspace
+idempotency key. Terminal states cannot be reclaimed, and cancellation clears
+leases before further work.
+
+The only valid order is Idea Scout → production → quality → publishing. Live
+policy, stop switch, capability, review, and cost gates are read again directly
+before each side-effecting boundary. Boundary resource IDs refer to the real
+existing tables; a missing adapter or prerequisite becomes a durable blocker.
+There is no scheduler-specific provider fallback.
+
+Review cadence is based on `automation_review_counters`, not a non-atomic query.
+The database increments the counter in the same transaction that inserts a real
+published post and resets it when an immutable approved quality decision is
+inserted. For an after-N policy, the next publish pauses once the counter is N
+or greater (including exact thresholds 10 and 20). Replays cannot double-count
+because `published_posts.publish_request_id` is unique.
+
 Responses use `{ data, request_id }` or `{ error: { code, message, details }, request_id }`.
 Collections are cursor-paginated and always workspace-scoped.
 
