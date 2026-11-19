@@ -11,7 +11,7 @@ VantaForge is an AI-assisted short-form video operating system for high-quality 
 - **Quality Gate**: safety, factuality, brand fit, pacing, hook strength, audio/visual quality, platform compliance, and human approval policies.
 - **Publishing**: YouTube and Instagram connections, scheduling, retries, idempotency, and post-publish status.
 - **Growth Analyst**: channel analytics, retention/engagement patterns, experiment suggestions, and next-idea ranking.
-- **AI provider settings**: user-owned API keys stored encrypted, model allowlist, capability checks, warning states, quotas, and fallback behavior. No server-side AI key is assumed.
+- **AI provider settings**: user-owned API keys stored encrypted, model allowlist, capability checks, warning states, quotas, and explicit blocked states. No server-side AI key is assumed.
 
 ## Core domain flow
 
@@ -56,18 +56,17 @@ provider or require an AI credential.
 
 Apply [`0001_identity.sql`](./src/server/migrations/0001_identity.sql) to a D1
 database, set its ID in [`wrangler.toml`](./wrangler.toml), then run the Worker
-with Wrangler. The Worker exposes signup/login/logout, `GET /v1/me`, workspace
+with Wrangler. The Worker exposes signup/login/logout, `GET /v1/auth/me`, workspace
 CRUD under `/v1/workspaces`, and automation-policy read/update under
-`/v1/workspaces/:id/automation-policy`.
+`/v1/workspaces/:id/policy`.
 
 Passwords are salted and derived with PBKDF2-SHA-256 using Web Crypto. Session
 tokens are random, only their SHA-256 digests are stored, and expired sessions
 are rejected. Workspace access is always resolved through an active
-membership. Owners and admins can edit or suspend workspaces and change the
-automation policy; other members can read resources. Errors are stable and
-include a request ID without exposing database or credential details. Workspace
-creation initializes an explicit assisted-mode policy, with no mock data or AI
-fallback involved.
+membership. Owners and admins can edit workspace settings and change the
+automation policy; other members can read resources. Errors are structured
+without exposing database or credential details. Workspace creation initializes
+an explicit assisted-mode policy, with no mock data or AI fallback involved.
 
 Local verification:
 

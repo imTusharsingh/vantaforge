@@ -6,7 +6,7 @@ type User = { id: string; email: string; display_name: string; status: string };
 type Auth = { user: User; token: string };
 
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) => Response.json(body, { status, headers: { "cache-control": "no-store", ...headers } });
-const fail = (status: number, code: string, message: string) => json({ error: { code, message } }, status);
+const fail = (status: number, code: string, message: string) => json({ error: { code, message }, request_id: crypto.randomUUID() }, status);
 const now = () => new Date().toISOString();
 
 async function body(request: Request): Promise<Record<string, unknown>> {

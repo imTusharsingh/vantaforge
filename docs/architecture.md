@@ -248,7 +248,7 @@ signup and login use Web Crypto PBKDF2-SHA-256, and the session cookie contains
 a random token whose digest is persisted in D1.
 
 All workspace reads and writes call the membership authorization check. Only
-owners/admins can update or suspend a workspace or patch its policy. Policy
-updates validate mode, review mode, capability names, cost limits, and the stop
-switch, and increment the policy version. No AI credentials, provider calls,
-mock records, or synthetic fallback behavior are part of this module.
+owners/admins can update workspace settings or patch its policy. Policy updates
+validate mode, review mode, and the stop switch, and increment the policy
+version. No AI credentials, provider calls, mock records, or synthetic fallback
+behavior are part of this module.
