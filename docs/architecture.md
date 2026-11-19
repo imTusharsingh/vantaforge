@@ -315,3 +315,43 @@ The candidate table is a persistence boundary for future evidence-backed work,
 not a source of seeded records. A real source integration and generation adapter,
 including evidence validation and actual usage/cost accounting, are still needed
 before discovery can succeed.
+
+## Implemented real-footage production boundary
+
+Migration `0005_production.sql` follows Idea Scout and adds immutable approved
+briefs, workspace-scoped production jobs, append-only state events and an
+append-only actual-cost ledger. An editor can approve a brief with
+`POST /v1/ideas/{id}/approve-brief` and `{content}` only for an evidence-backed
+candidate of a successful run in their active workspace. Creation uses
+`POST /v1/workspaces/{id}/production-jobs`, `{brief_id, asset_ids, provider}`,
+and `Idempotency-Key`; reads use `GET /v1/production-jobs/{id}` and eligible
+jobs can be cancelled with `POST /v1/production-jobs/{id}/cancel`. Access is
+membership-scoped; mutation requires owner, admin, or editor. Replays with the
+same normalized inputs return the existing job; a different request conflicts.
+
+The state graph is `planning -> provider_preparation -> rendering ->
+awaiting_review -> completed`, with `blocked`, `failed`, and `cancelled`
+branches; terminal states cannot advance, and a blocked attempt can only be
+cancelled. This slice records planning and the resulting blocked state
+transactionally. There is no worker or endpoint that advances a job to rendering
+or claims review/completion. A new attempt requires a new idempotency key and
+rechecks the current prerequisites.
+
+The immutable job snapshot records policy, provider/model and verification
+time, selected asset IDs, the ceiling in integer USD millionths, and a nullable
+estimate with a reason. Missing/invalid ceilings and unknown or excessive
+estimates fail closed. There is no supported estimate or billable call in this
+slice: `estimate_microusd` is null and `estimate_reason` is
+`render_provider_unavailable`; the actual ledger remains empty. Before adding
+any provider call, an adapter must provide a binding upper bound, atomically
+reserve the full maximum against the ceiling including prior actuals and
+concurrent reservations, enforce provider-side limits, and record real usage and
+cost. The current cost helper alone is not a reservation mechanism. Never infer
+zero cost from an empty ledger or an unknown estimate.
+
+Current hard blockers include unavailable Idea Scout generation and trend
+sources, unavailable asset malware scanning, missing/invalid licensing,
+workspace policy, missing or unverified user-owned provider credentials/model,
+missing ceiling, and unavailable render pricing/provider. No AI credential is
+read from configuration or stored in a job snapshot. No output asset, URL,
+usage, or price is fabricated.
