@@ -238,3 +238,17 @@ memberships, encrypted and verified provider connections, shared jobs and
 transitions, idempotency/audit/outbox, policy snapshots, and one real provider
 adapter. Until credentials and capability checks pass, return
 `CREDENTIAL_REQUIRED` or `CONNECTION_NOT_VERIFIED` and never pretend success.
+
+## Implemented identity slice
+
+`src/server/index.ts` is the initial Cloudflare Worker boundary. D1 migration
+`src/server/migrations/0001_identity.sql` persists users, sessions, workspaces,
+memberships, and automation policies. Authentication is provider-independent:
+signup and login use Web Crypto PBKDF2-SHA-256, and the session cookie contains
+a random token whose digest is persisted in D1.
+
+All workspace reads and writes call the membership authorization check. Only
+owners/admins can update or suspend a workspace or patch its policy. Policy
+updates validate mode, review mode, capability names, cost limits, and the stop
+switch, and increment the policy version. No AI credentials, provider calls,
+mock records, or synthetic fallback behavior are part of this module.

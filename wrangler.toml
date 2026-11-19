@@ -1,0 +1,9 @@
+name = "vantaforge"
+main = "src/server/index.ts"
+compatibility_date = "2026-11-19"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "vantaforge"
+database_id = "replace-with-your-d1-database-id"
+migrations_dir = "src/server/migrations"

@@ -47,3 +47,33 @@ Automation is explicit and reversible. Each workspace can independently configur
 ## Security principles
 
 User AI keys are encrypted at rest, never logged, and only decrypted at the provider boundary. OAuth tokens are encrypted and scoped minimally. Uploaded assets are private by default. Every automated action is auditable and cancellable.
+
+## Identity and workspace foundation
+
+The first runnable backend slice is a dependency-light Cloudflare Worker backed
+by D1. It lives under [`src/server/`](./src/server/) and does not call an AI
+provider or require an AI credential.
+
+Apply [`0001_identity.sql`](./src/server/migrations/0001_identity.sql) to a D1
+database, set its ID in [`wrangler.toml`](./wrangler.toml), then run the Worker
+with Wrangler. The Worker exposes signup/login/logout, `GET /v1/me`, workspace
+CRUD under `/v1/workspaces`, and automation-policy read/update under
+`/v1/workspaces/:id/automation-policy`.
+
+Passwords are salted and derived with PBKDF2-SHA-256 using Web Crypto. Session
+tokens are random, only their SHA-256 digests are stored, and expired sessions
+are rejected. Workspace access is always resolved through an active
+membership. Owners and admins can edit or suspend workspaces and change the
+automation policy; other members can read resources. Errors are stable and
+include a request ID without exposing database or credential details. Workspace
+creation initializes an explicit assisted-mode policy, with no mock data or AI
+fallback involved.
+
+Local verification:
+
+```sh
+npm install
+npm run check
+npx wrangler d1 migrations apply vantaforge --local
+npx wrangler dev
+```
