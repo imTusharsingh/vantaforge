@@ -5,8 +5,8 @@
 Run:
 
 ```sh
-npm install
-npm run check
+pnpm install
+pnpm run check
 git diff --check
 ```
 
