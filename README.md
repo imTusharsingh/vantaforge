@@ -220,3 +220,37 @@ the workspace's encrypted, live-verified credential and selected vision model.
 Production completion is protected by the migration trigger requiring a passed
 quality gate; the existing immutable cost ledger and unknown-cost blocker remain
 unchanged, so no billable AI call can bypass the ceiling.
+
+## Publishing adapters
+
+Migration [`0007_publishing.sql`](./src/server/migrations/0007_publishing.sql)
+adds workspace-scoped YouTube and Instagram OAuth connections and durable
+publish requests. OAuth state and nonce values are one-time, hashed in D1, and
+expire after ten minutes. Access and refresh tokens use the same AES-GCM
+`CREDENTIAL_ENCRYPTION_KEY` mechanism as AI credentials; tokens, ciphertext,
+authorization headers, and client secrets are never returned or logged.
+
+Configure platform credentials as dedicated runtime bindings, never as AI
+settings: `YOUTUBE_CLIENT_ID`, `YOUTUBE_CLIENT_SECRET`, `INSTAGRAM_CLIENT_ID`,
+`INSTAGRAM_CLIENT_SECRET`, and `PUBLIC_BASE_URL`. OAuth is started with
+`POST /v1/workspaces/:id/publishing-connections/oauth`, connections are listed
+with `GET /v1/workspaces/:id/publishing-connections`, and revoked with
+`POST /v1/publishing-connections/:id/revoke`.
+
+`POST /v1/workspaces/:id/publish-requests` requires a completed production job,
+a passed and reviewer-approved quality gate, a ready/clean/licensed real-footage
+asset, a permitted publishing policy, an active connection with required
+scopes, an idempotency key, and platform-valid metadata. Metadata is rejected
+when it exceeds official limits: YouTube title 100 characters, description
+5000, Shorts duration at most 60 seconds; Instagram Reels caption 2200 and
+duration at most 90 seconds. Nothing is silently truncated.
+
+`POST /v1/publish-requests/:id/attempt` is the durable worker boundary. Due
+transient failures move to `retry_scheduled` with capped exponential backoff;
+platform rejection and capability blockers are persisted as failed/blocked.
+The YouTube adapter uses the official resumable upload API and creates a post
+record only after the API returns a real video ID. Instagram currently remains
+blocked with `media_upload_unavailable`: Instagram Graph publishing requires a
+publicly reachable media URL, while this slice deliberately keeps source media
+private in R2 and has no configured official media-delivery capability. No
+placeholder connection, upload ID, URL, success, or analytics is created.

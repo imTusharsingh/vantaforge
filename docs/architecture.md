@@ -369,3 +369,22 @@ thumbnail, score, finding, usage, or approval is synthesized. A database
 trigger prevents a production job from reaching `completed` without a passed
 quality gate, while existing immutable cost-ledger and ceiling rules remain in
 force.
+
+## Implemented publishing boundary
+
+Migration `0007_publishing.sql` adds one workspace-scoped connection per
+platform, one-time hashed OAuth state/nonce records, durable publish requests,
+immutable attempt events, and provider post records. Tokens are encrypted with
+the existing credential key and are used only at the official adapter boundary.
+Publish creation re-checks membership, the automation stop switch and enabled
+capability, completed production, passed quality, reviewer approval, asset
+readiness/licensing, connection status/expiry/scopes, idempotency, schedule,
+and platform metadata limits. Attempts re-check due state and use capped
+exponential backoff for transient provider failures.
+
+The YouTube adapter uses the official resumable upload API and persists a post
+only after a real provider video ID is returned. Instagram is explicitly
+blocked until an official public media delivery capability exists: Graph API
+Reels publishing requires a publicly reachable media URL, and the current R2
+asset boundary is private. No synthetic connection, upload ID, URL, success, or
+analytics is written.
