@@ -295,3 +295,23 @@ return `provider_unverified`; they do not pretend the credential works. Model
 selection is allowed only after a connection is verified. Missing keys,
 unsupported models, invalid credentials, and missing encryption configuration
 produce typed hard errors.
+
+## Implemented Idea Scout boundary
+
+Migration `0004_idea_scout.sql` adds workspace-scoped runs and candidate storage.
+`POST /v1/workspaces/:id/idea-runs` accepts a provider and a required
+`Idempotency-Key`; `GET /v1/idea-runs/:id` requires active membership. Owners,
+admins, and editors can create runs. The policy must enable `idea_discovery`,
+the stop switch must be off, and the workspace must be active. Each attempt
+persists the policy and selected provider/model snapshot and its terminal
+blocker. Workspace/key uniqueness and a request hash make concurrent replays
+stable and reject conflicting requests. A corrected configuration requires a
+new key and a new attempt. Usage and cost remain null without a provider call.
+
+The repository has no external trend-source integration or Idea Scout generation
+adapter. Runs therefore stop at `trend_source_unavailable` after credential,
+verification, model, and policy checks; they cannot currently produce ideas.
+The candidate table is a persistence boundary for future evidence-backed work,
+not a source of seeded records. A real source integration and generation adapter,
+including evidence validation and actual usage/cost accounting, are still needed
+before discovery can succeed.

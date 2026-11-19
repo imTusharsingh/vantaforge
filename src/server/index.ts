@@ -1,3 +1,4 @@
+import { ideaScoutBlocker } from "./idea-scout";
 import { decryptSecret, encryptSecret, hashPassword, randomId, randomToken, sha256, verifyPassword } from "./crypto";
 import { modelDefinition, PROVIDERS, providerDefinition } from "./providers";
 import { asRecord, email, password, requiredString, slug, ValidationError } from "./validation";
@@ -244,9 +245,52 @@ async function listAssets(request: Request, db: D1Database, auth: Auth, workspac
 async function getAsset(request: Request, db: D1Database, auth: Auth, assetId: string) { const asset = await db.prepare("SELECT id,workspace_id,kind,media_type,original_filename,bytes,checksum,duration_seconds,width,height,metadata,license_type,license_id,source_url,rights_confirmed,attribution_required,attribution_text,scan_status,licensing_status,status,blocked_reason,created_by_user_id,created_at,updated_at FROM assets WHERE id=?1").bind(assetId).first<AssetRow>(); if (!asset) throw new HttpError(404, "asset_not_found", "Asset not found"); await providerAccess(request, db, auth, asset.workspace_id); const references = await db.prepare("SELECT id,source,source_url,license_id,expires_at,attribution_required,usage_scope,created_at FROM asset_references WHERE asset_id=?1 ORDER BY created_at ASC").bind(assetId).all(); return json({ data: { ...publicAsset(asset), references: references.results } }); }
 async function downloadAsset(request: Request, db: D1Database, auth: Auth, env: Env, assetId: string) { if (!env.ASSETS) throw new HttpError(503, "storage_unavailable", "Private asset storage is not configured"); const asset = await db.prepare("SELECT id,workspace_id,storage_key,media_type,original_filename,status FROM assets WHERE id=?1").bind(assetId).first<{ id: string; workspace_id: string; storage_key: string; media_type: string; original_filename: string; status: string }>(); if (!asset) throw new HttpError(404, "asset_not_found", "Asset not found"); await providerAccess(request, db, auth, asset.workspace_id); if (asset.status !== "ready") throw new HttpError(409, "asset_not_ready", "This asset is not ready for download"); const object = await env.ASSETS.get(asset.storage_key); if (!object) throw new HttpError(404, "asset_content_not_found", "Asset content not found"); return new Response(object.body, { headers: { "cache-control": "private, no-store", "content-type": asset.media_type, "content-disposition": `inline; filename="${asset.original_filename.replaceAll(/["\\\r\n]/g, "_")}"` } }); }
 
+type IdeaRun = { id: string; workspace_id: string; created_by_user_id: string; idempotency_key: string; request_hash: string; provider_snapshot: string; policy_snapshot: string; status: string; blocker_code: string | null; usage_json: string | null; cost_json: string | null; created_at: string; completed_at: string };
+
+function publicIdeaRun(run: IdeaRun, ideas: unknown[]) {
+  return { id: run.id, workspace_id: run.workspace_id, status: run.status, blocker: run.blocker_code ? { code: run.blocker_code, retryable: false } : null, provider_snapshot: JSON.parse(run.provider_snapshot), policy_snapshot: JSON.parse(run.policy_snapshot), usage: run.usage_json ? JSON.parse(run.usage_json) : null, cost: run.cost_json ? JSON.parse(run.cost_json) : null, created_at: run.created_at, completed_at: run.completed_at, ideas };
+}
+
+async function ideaRunResponse(db: D1Database, run: IdeaRun, status = 200) {
+  const ideas = await db.prepare("SELECT id,title,premise,evidence_json,trend_signals_json,created_at FROM idea_candidates WHERE run_id=?1 AND workspace_id=?2 ORDER BY created_at,id").bind(run.id, run.workspace_id).all<{ id: string; title: string; premise: string; evidence_json: string; trend_signals_json: string; created_at: string }>();
+  return json({ data: publicIdeaRun(run, ideas.results.map(({ evidence_json, trend_signals_json, ...idea }) => ({ ...idea, evidence: JSON.parse(evidence_json), trend_signals: JSON.parse(trend_signals_json) }))) }, status);
+}
+
+async function createIdeaRun(request: Request, db: D1Database, auth: Auth, workspaceId: string) {
+  const member = await providerAccess(request, db, auth, workspaceId);
+  if (!["owner", "admin", "editor"].includes(String(member.role))) throw new HttpError(403, "forbidden", "Only owners, admins and editors can start Idea Scout runs");
+  const key = requiredString(request.headers.get("Idempotency-Key"), "Idempotency-Key", 200);
+  const input = await body(request);
+  if (Object.keys(input).some((key) => key !== "provider")) throw new ValidationError("Only provider is accepted");
+  const provider = requiredString(input.provider, "provider", 80);
+  if (!providerDefinition(provider)) throw new HttpError(422, "provider_unsupported", "The provider is not in the supported catalog");
+  const hash = await sha256(JSON.stringify({ provider }));
+  const existing = await db.prepare("SELECT * FROM idea_scout_runs WHERE workspace_id=?1 AND idempotency_key=?2").bind(workspaceId, key).first<IdeaRun>();
+  if (existing) { if (existing.request_hash !== hash) throw new HttpError(409, "idempotency_conflict", "Idempotency key was used for a different request"); return ideaRunResponse(db, existing); }
+  const policy = await db.prepare("SELECT * FROM automation_policies WHERE workspace_id=?1").bind(workspaceId).first<Record<string, unknown>>();
+  if (!policy) throw new HttpError(409, "policy_not_found", "Automation policy not found");
+  const connection = await connectionFor(db, workspaceId, provider);
+  const snapshot = { provider, model: connection?.selected_model ?? null, verified_at: connection?.last_verified_at ?? null };
+  const enabled = JSON.parse(String(policy.enabled_capabilities));
+  const blocker = ideaScoutBlocker({ active: member.status === "active", stopped: Boolean(policy.stop_switch), enabled, credential: Boolean(connection?.encrypted_secret), verified: connection?.status === "verified" && Boolean(connection.last_verified_at), modelSupported: Boolean(connection?.selected_model && modelDefinition(providerDefinition(provider)!, connection.selected_model)?.capabilities.includes("text_generation")) });
+  const id = randomId(); const timestamp = now();
+  await db.prepare("INSERT INTO idea_scout_runs (id,workspace_id,created_by_user_id,idempotency_key,request_hash,provider_snapshot,policy_snapshot,status,blocker_code,created_at,completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'blocked',?8,?9,?9) ON CONFLICT(workspace_id,idempotency_key) DO NOTHING").bind(id, workspaceId, auth.user.id, key, hash, JSON.stringify(snapshot), JSON.stringify(policy), blocker, timestamp).run();
+  const run = await db.prepare("SELECT * FROM idea_scout_runs WHERE workspace_id=?1 AND idempotency_key=?2").bind(workspaceId, key).first<IdeaRun>();
+  if (!run) throw new HttpError(500, "internal_error", "The run could not be recorded");
+  if (run.request_hash !== hash) throw new HttpError(409, "idempotency_conflict", "Idempotency key was used for a different request");
+  return ideaRunResponse(db, run, run.id === id ? 201 : 200);
+}
+
+async function getIdeaRun(request: Request, db: D1Database, auth: Auth, id: string) {
+  const run = await db.prepare("SELECT * FROM idea_scout_runs WHERE id=?1").bind(id).first<IdeaRun>();
+  if (!run) throw new HttpError(404, "idea_run_not_found", "Idea Scout run not found");
+  await providerAccess(request, db, auth, run.workspace_id);
+  return ideaRunResponse(db, run);
+}
+
 export default { async fetch(request: Request, env: Env): Promise<Response> {
   const headers: HeadersInit = {};
-  if (env.ALLOWED_ORIGIN) Object.assign(headers, { "access-control-allow-origin": env.ALLOWED_ORIGIN, "access-control-allow-headers": "authorization,content-type", "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS" });
+  if (env.ALLOWED_ORIGIN) Object.assign(headers, { "access-control-allow-origin": env.ALLOWED_ORIGIN, "access-control-allow-headers": "authorization,content-type,idempotency-key", "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS" });
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers });
   try {
     const url = new URL(request.url); const path = url.pathname.replace(/\/+$/, "") || "/";
@@ -259,6 +303,8 @@ export default { async fetch(request: Request, env: Env): Promise<Response> {
     if (path === "/v1/auth/logout" && request.method === "POST") { await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?1").bind(await sha256(auth.token)).run(); return json({ data: { logged_out: true } }, 200, headers); }
     if (path === "/v1/workspaces" && request.method === "GET") return json({ data: await env.DB.prepare("SELECT w.*, m.role FROM workspaces w JOIN memberships m ON m.workspace_id=w.id WHERE m.user_id=?1 AND m.status='active' ORDER BY w.created_at DESC").bind(auth.user.id).all() }, 200, headers);
     if (path === "/v1/workspaces" && request.method === "POST") return await createWorkspace(request, env.DB, auth);
+    const ideaRunsMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/idea-runs$/); if (ideaRunsMatch && request.method === "POST") return await createIdeaRun(request, env.DB, auth, ideaRunsMatch[1]);
+    const ideaRunMatch = path.match(/^\/v1\/idea-runs\/([^/]+)$/); if (ideaRunMatch && request.method === "GET") return await getIdeaRun(request, env.DB, auth, ideaRunMatch[1]);
     const assetsMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/assets$/); if (assetsMatch && request.method === "GET") return await listAssets(request, env.DB, auth, assetsMatch[1]);
     const uploadIntentMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/assets\/uploads$/); if (uploadIntentMatch && request.method === "POST") return await createUploadIntent(request, env.DB, auth, env, uploadIntentMatch[1]);
     const assetMatch = path.match(/^\/v1\/assets\/([^/]+)(?:\/(complete|download))?$/); if (assetMatch) { if (!assetMatch[2] && request.method === "GET") return await getAsset(request, env.DB, auth, assetMatch[1]); if (assetMatch[2] === "complete" && request.method === "POST") return await completeAsset(request, env.DB, auth, env, assetMatch[1]); if (assetMatch[2] === "download" && request.method === "GET") return await downloadAsset(request, env.DB, auth, env, assetMatch[1]); }
