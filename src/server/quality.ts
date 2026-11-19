@@ -1,3 +1,5 @@
+import { validateMediaMetadata } from './render-adapters.ts';
+
 export type QualitySeverity = "blocking" | "warning";
 export type QualityFinding = {
   code: string;
@@ -8,6 +10,7 @@ export type QualityFinding = {
 
 export type QualityAsset = {
   id: string;
+  storage_key?: string;
   kind: string;
   media_type: string;
   duration_seconds: number | null;
@@ -43,6 +46,7 @@ export function evaluateDeterministicQuality(job: QualityJob, assets: QualityAss
     try { const parsed: unknown = JSON.parse(asset.metadata); if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) metadata = parsed as Record<string, unknown>; } catch { /* malformed metadata is not readiness evidence */ }
     if (metadata.audio_ready !== true) findings.push(finding("audio_readiness_unavailable", "Audio readiness must be explicitly confirmed by a media inspection adapter", ref));
     if (metadata.captions_ready !== true) findings.push(finding("caption_readiness_unavailable", "Caption readiness must be explicitly confirmed by a media inspection adapter", ref));
+    for (const item of validateMediaMetadata(metadata, "source", asset.storage_key)) findings.push(finding(`media_${item.code}`, `Media inspection did not provide ${item.field}`, ref));
     if (asset.status !== "ready" || asset.scan_status !== "clean") findings.push(finding("asset_not_production_ready", "The asset is not production eligible until its scan is clean and status is ready", ref));
     if (asset.licensing_status !== "valid" || !asset.rights_confirmed || !asset.license_type) findings.push(finding("rights_or_licensing_not_ready", "Rights confirmation and valid licensing metadata are required", ref));
     // Expiry is checked by the route against asset_references; this evidence marker

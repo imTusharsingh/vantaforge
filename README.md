@@ -214,13 +214,14 @@ A replay of the same key and input returns the same job; different input returns
 Production is currently a **blocked boundary**, not a rendering service. It
 checks the workspace policy (`production` capability and stop switch), approved
 brief, asset scan and licensing, verified workspace provider/model, and a
-positive per-job USD ceiling. The immutable estimate is unknown because no real
-render adapter or enforceable price bound exists. No billable calls are made,
-no usage is invented, and the actual ledger is empty. The job exposes a typed
-blocker and an estimate reason. Idea Scout currently cannot create successful
-candidates, and the asset scanner is unavailable; these upstream capabilities,
-a real renderer, provider credentials, and bounded pricing are required before
-production can proceed. See `docs/architecture.md` for the state and cost contract.
+positive per-job USD ceiling. Migration `0009_render_adapters.sql` records the
+real-footage capability snapshot and an idempotent render attempt. The current
+catalog has no supported real-footage renderer, so the job and attempt are
+durably blocked with `provider_unavailable`; no billable call, output, cost, or
+metadata is invented. A future adapter must provide source ingest, editing and
+rendering, optional captions/voiceover, output inspection, provider-reported
+usage, and a bounded estimate before it can be registered. See
+`docs/architecture.md` for the state and cost contract.
 
 ### Quality Gate and cost ledger boundary
 

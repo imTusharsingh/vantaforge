@@ -156,6 +156,20 @@ AES key comes from the dedicated `CREDENTIAL_ENCRYPTION_KEY` runtime secret
 binding; no provider key is read from an environment variable. Invalid or
 missing encryption configuration is a typed hard error.
 
+### Real-footage render adapters
+
+`src/server/render-adapters.ts` is the only application boundary for a
+real-footage renderer. An adapter must declare source ingest, edit/render,
+caption, voiceover, and output-inspection capabilities; return a bounded cost
+estimate before a billable call; report provider job identity and actual usage;
+and return inspection evidence for container/codec, duration, 9:16 handling,
+frame rate, audio, captions, integrity, and storage identity. The supported
+catalog is currently empty because no configured provider offers that complete
+contract. Production therefore persists `provider_unavailable` and performs
+no external generation or rendering. `0009_render_adapters.sql` stores the
+capability snapshot and idempotent render attempt so retries cannot turn a
+blocked request into an untracked side effect.
+
 The allowlist currently contains OpenAI (`gpt-4o-mini`, `gpt-4o`, and
 `gpt-4.1-mini`) and Anthropic (`claude-3-5-sonnet-latest`). OpenAI is the only
 provider with a live adapter in this slice and is verified with its models
@@ -354,7 +368,7 @@ time, selected asset IDs, the ceiling in integer USD millionths, and a nullable
 estimate with a reason. Missing/invalid ceilings and unknown or excessive
 estimates fail closed. There is no supported estimate or billable call in this
 slice: `estimate_microusd` is null and `estimate_reason` is
-`render_provider_unavailable`; the actual ledger remains empty. Before adding
+`provider_unavailable`; the actual ledger remains empty. Before adding
 any provider call, an adapter must provide a binding upper bound, atomically
 reserve the full maximum against the ceiling including prior actuals and
 concurrent reservations, enforce provider-side limits, and record real usage and
