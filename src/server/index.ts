@@ -183,34 +183,34 @@ export default { async fetch(request: Request, env: Env): Promise<Response> {
   try {
     const url = new URL(request.url); const path = url.pathname.replace(/\/+$/, "") || "/";
     if (path === "/health" && request.method === "GET") return json({ data: { status: "ok" } }, 200, headers);
-    if (path === "/v1/auth/signup" && request.method === "POST") return signup(request, env.DB);
-    if (path === "/v1/auth/login" && request.method === "POST") return login(request, env.DB);
+    if (path === "/v1/auth/signup" && request.method === "POST") return await signup(request, env.DB);
+    if (path === "/v1/auth/login" && request.method === "POST") return await login(request, env.DB);
     const auth = requireAuth(await authenticate(request, env.DB));
     if (path === "/v1/auth/me" && request.method === "GET") return json({ data: { user: auth.user } }, 200, headers);
     if (path === "/v1/auth/logout" && request.method === "POST") { await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?1").bind(await sha256(auth.token)).run(); return json({ data: { logged_out: true } }, 200, headers); }
     if (path === "/v1/workspaces" && request.method === "GET") return json({ data: await env.DB.prepare("SELECT w.*, m.role FROM workspaces w JOIN memberships m ON m.workspace_id=w.id WHERE m.user_id=?1 AND m.status='active' ORDER BY w.created_at DESC").bind(auth.user.id).all() }, 200, headers);
-    if (path === "/v1/workspaces" && request.method === "POST") return createWorkspace(request, env.DB, auth);
+    if (path === "/v1/workspaces" && request.method === "POST") return await createWorkspace(request, env.DB, auth);
     const providerListMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/ai-providers$/);
-    if (providerListMatch && request.method === "GET") return listProviders(request, env.DB, auth, providerListMatch[1]);
+    if (providerListMatch && request.method === "GET") return await listProviders(request, env.DB, auth, providerListMatch[1]);
     const providerModelsMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/ai-providers\/models$/);
-    if (providerModelsMatch && request.method === "GET") return listModels(request, env.DB, auth, providerModelsMatch[1]);
+    if (providerModelsMatch && request.method === "GET") return await listModels(request, env.DB, auth, providerModelsMatch[1]);
     const providerCredentialMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/ai-providers\/([^/]+)\/credentials$/);
-    if (providerCredentialMatch && request.method === "PUT") return saveCredential(request, env.DB, auth, env, providerCredentialMatch[1], providerCredentialMatch[2]);
-    if (providerCredentialMatch && request.method === "DELETE") return deleteCredential(request, env.DB, auth, providerCredentialMatch[1], providerCredentialMatch[2]);
+    if (providerCredentialMatch && request.method === "PUT") return await saveCredential(request, env.DB, auth, env, providerCredentialMatch[1], providerCredentialMatch[2]);
+    if (providerCredentialMatch && request.method === "DELETE") return await deleteCredential(request, env.DB, auth, providerCredentialMatch[1], providerCredentialMatch[2]);
     const providerModelMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/ai-providers\/([^/]+)\/models$/);
-    if (providerModelMatch && request.method === "PATCH") return selectModel(request, env.DB, auth, providerModelMatch[1], providerModelMatch[2]);
+    if (providerModelMatch && request.method === "PATCH") return await selectModel(request, env.DB, auth, providerModelMatch[1], providerModelMatch[2]);
     const providerVerifyMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/ai-providers\/([^/]+)\/verify$/);
-    if (providerVerifyMatch && request.method === "POST") return verifyProvider(request, env.DB, auth, env, providerVerifyMatch[1], providerVerifyMatch[2]);
+    if (providerVerifyMatch && request.method === "POST") return await verifyProvider(request, env.DB, auth, env, providerVerifyMatch[1], providerVerifyMatch[2]);
     const providerIdMatch = path.match(/^\/v1\/ai-providers\/([^/]+)\/(credentials|models|verify)$/);
     if (providerIdMatch) {
       const connection = await env.DB.prepare("SELECT id,workspace_id,provider,credential_kind,encrypted_secret,selected_model,status,last_verified_at,last_error_code,created_at,updated_at FROM ai_provider_connections WHERE id=?1").bind(providerIdMatch[1]).first<ProviderConnection>();
       if (!connection) throw new HttpError(404, "provider_connection_not_found", "Provider connection not found");
-      if (providerIdMatch[2] === "credentials" && request.method === "PUT") return saveCredential(request, env.DB, auth, env, connection.workspace_id, connection.provider);
-      if (providerIdMatch[2] === "credentials" && request.method === "DELETE") return deleteCredential(request, env.DB, auth, connection.workspace_id, connection.id);
-      if (providerIdMatch[2] === "models" && request.method === "PATCH") return selectModel(request, env.DB, auth, connection.workspace_id, connection.id);
-      if (providerIdMatch[2] === "verify" && request.method === "POST") return verifyProvider(request, env.DB, auth, env, connection.workspace_id, connection.id);
+      if (providerIdMatch[2] === "credentials" && request.method === "PUT") return await saveCredential(request, env.DB, auth, env, connection.workspace_id, connection.provider);
+      if (providerIdMatch[2] === "credentials" && request.method === "DELETE") return await deleteCredential(request, env.DB, auth, connection.workspace_id, connection.id);
+      if (providerIdMatch[2] === "models" && request.method === "PATCH") return await selectModel(request, env.DB, auth, connection.workspace_id, connection.id);
+      if (providerIdMatch[2] === "verify" && request.method === "POST") return await verifyProvider(request, env.DB, auth, env, connection.workspace_id, connection.id);
     }
-    const match = path.match(/^\/v1\/workspaces\/([^/]+)(?:\/(policy))?$/); if (match) { if (match[2] === "policy") return policy(request, env.DB, auth, match[1]); if (request.method === "PUT") return updateWorkspace(request, env.DB, auth, match[1]); if (request.method === "GET") { const item = await workspace(request, env.DB, auth.user.id, match[1]); if (!item) throw new HttpError(404, "workspace_not_found", "Workspace not found"); return json({ data: item }, 200, headers); } }
+    const match = path.match(/^\/v1\/workspaces\/([^/]+)(?:\/(policy))?$/); if (match) { if (match[2] === "policy") return await policy(request, env.DB, auth, match[1]); if (request.method === "PUT") return await updateWorkspace(request, env.DB, auth, match[1]); if (request.method === "GET") { const item = await workspace(request, env.DB, auth.user.id, match[1]); if (!item) throw new HttpError(404, "workspace_not_found", "Workspace not found"); return json({ data: item }, 200, headers); } }
     return fail(404, "not_found", "Route not found");
   } catch (error) { if (error instanceof HttpError) return fail(error.status, error.code, error.message); if (error instanceof ValidationError) return fail(400, "validation_error", error.message); console.error(error); return fail(500, "internal_error", "The request could not be completed"); }
 } };
