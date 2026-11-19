@@ -157,6 +157,27 @@ secret. Credentials are encrypted with Web Crypto AES-GCM before D1 storage.
 Apply [`0002_ai_provider_settings.sql`](./src/server/migrations/0002_ai_provider_settings.sql)
 after the identity migration.
 
+## Growth Analyst analytics slice
+
+Migration [`0008_analytics.sql`](./src/server/migrations/0008_analytics.sql)
+adds workspace-scoped analytics runs, provider/account snapshots, source
+references with official-API attribution and response hashes, normalized
+metrics, and fail-closed next-short suggestions. Reconnecting a publishing
+account requests the additional YouTube Analytics or Instagram Insights scope;
+existing connections without that scope are recorded as `scope_missing`.
+
+Routes are `POST /v1/workspaces/:id/analytics-runs` (requires an
+`Idempotency-Key` and `{ platform, start_date, end_date }`),
+`GET /v1/analytics-runs/:id`, `GET /v1/workspaces/:id/analytics`, and
+`POST /v1/workspaces/:id/experiment-suggestions` (also idempotent). A run only
+persists metrics returned by the official connected-account API. Missing
+membership, policy permission, connection/scopes, credentials, provider data,
+rate limits, or API access are durable typed blockers/failures; no zeroes,
+trends, rankings, or recommendations are synthesized. Suggestions are created
+only from persisted metrics and a verified, selected user AI model; otherwise
+the suggestion is persisted as blocked with no suggestion content. Access and
+refresh tokens remain encrypted and are never included in analytics responses.
+
 ## Idea Scout runs
 
 Apply migration [`0004_idea_scout.sql`](./src/server/migrations/0004_idea_scout.sql)

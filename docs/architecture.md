@@ -126,6 +126,18 @@ ExperimentSuggestion { id, workspace_id, evidence_snapshot_ids, hypothesis,
 Analytics are provider-reported observations. Missing permission or an
 unavailable platform API is an integration warning/error, never synthetic data.
 
+The implemented analytics slice stores a durable `analytics_runs` record with
+the requested fetch window, policy/provider snapshots, status and blocker;
+`analytics_provider_snapshots`, `analytics_source_refs`, and
+`analytics_metrics` preserve the account context, official endpoint attribution
+and normalized values. YouTube Analytics and Instagram Insights are fetched
+only through the encrypted publishing connection. The OAuth flow requests the
+additional analytics scopes, while older connections fail closed with
+`scope_missing`. Rate limits, unavailable APIs, missing data and expired or
+revoked connections are persisted explicitly. `analytics_suggestions` is an
+evidence-bound contract: it can call only a verified, selected user AI model
+with persisted metrics, and otherwise records a blocker without content.
+
 ### AI settings
 
 ```text
@@ -241,7 +253,7 @@ use IDs and immutable snapshots, never shared provider secrets.
 | Production | `POST /v1/workspaces/{id}/production-jobs`; `GET /v1/production-jobs/{id}`; `POST /v1/production-jobs/{id}/cancel` | Plan, render, cost ledger, job state |
 | Quality Gate | `POST /v1/production-jobs/{id}/quality-gate`; `GET /v1/quality-gates/{id}`; `POST /v1/quality-gates/{id}/decision` | Checks, findings, policy/human decision |
 | Publishing | `POST /v1/workspaces/{id}/connections`; `POST /v1/publish-requests`; `POST /v1/publish-requests/{id}/cancel` | Verified connections and idempotent side effects |
-| Analytics | `POST /v1/published-posts/{id}/analytics-sync`; `GET /v1/workspaces/{id}/analytics`; `POST /v1/experiment-suggestions` | Provider snapshots and evidence-based suggestions |
+| Analytics | `POST /v1/workspaces/{id}/analytics-runs`; `GET /v1/analytics-runs/{id}`; `GET /v1/workspaces/{id}/analytics`; `POST /v1/workspaces/{id}/experiment-suggestions` | Provider snapshots, normalized evidence and fail-closed suggestions |
 | AI settings | `GET /v1/workspaces/{id}/ai-providers`; `GET /v1/workspaces/{id}/ai-providers/models`; `PUT|DELETE /v1/workspaces/{id}/ai-providers/{provider}/credentials`; `POST /v1/workspaces/{id}/ai-providers/{provider}/verify`; `PATCH /v1/workspaces/{id}/ai-providers/{provider}/models` | Encrypted credentials and capability/model allowlist |
 
 Mutations creating jobs, credentials, connections, or platform effects require
