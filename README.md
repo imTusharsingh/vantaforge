@@ -176,3 +176,27 @@ Even a verified provider therefore produces `trend_source_unavailable`, no
 ideas, and null usage and cost. No provider call or spend occurs in this slice.
 Real evidence collection, generation, and provider-reported usage are required
 before runs can succeed; no trends or candidates are synthesized.
+
+### Real-footage production boundary
+
+`POST /v1/ideas/{idea_id}/approve-brief` accepts `{ "content": "..." }` from
+an active workspace editor, admin, or owner. It requires an evidence-backed
+candidate from a successful Idea Scout run and records an immutable approval.
+`POST /v1/workspaces/{workspace_id}/production-jobs` accepts `brief_id`, a
+nonempty `asset_ids` array, and `provider`, with an `Idempotency-Key` header.
+`GET /v1/production-jobs/{id}` reads a job and its events and cost ledger;
+`POST /v1/production-jobs/{id}/cancel` cancels an eligible job. All require
+active workspace membership; creation and cancellation require editor access.
+A replay of the same key and input returns the same job; different input returns
+`idempotency_conflict`.
+
+Production is currently a **blocked boundary**, not a rendering service. It
+checks the workspace policy (`production` capability and stop switch), approved
+brief, asset scan and licensing, verified workspace provider/model, and a
+positive per-job USD ceiling. The immutable estimate is unknown because no real
+render adapter or enforceable price bound exists. No billable calls are made,
+no usage is invented, and the actual ledger is empty. The job exposes a typed
+blocker and an estimate reason. Idea Scout currently cannot create successful
+candidates, and the asset scanner is unavailable; these upstream capabilities,
+a real renderer, provider credentials, and bounded pricing are required before
+production can proceed. See `docs/architecture.md` for the state and cost contract.

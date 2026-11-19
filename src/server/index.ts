@@ -1,3 +1,4 @@
+import { canTransition, ceilingMicros, costBlocker, type ProductionState } from './production';
 import { ideaScoutBlocker } from "./idea-scout";
 import { decryptSecret, encryptSecret, hashPassword, randomId, randomToken, sha256, verifyPassword } from "./crypto";
 import { modelDefinition, PROVIDERS, providerDefinition } from "./providers";
@@ -288,6 +289,89 @@ async function getIdeaRun(request: Request, db: D1Database, auth: Auth, id: stri
   return ideaRunResponse(db, run);
 }
 
+type ProductionJob = { id: string; workspace_id: string; request_hash: string; status: string; [key: string]: unknown };
+async function productionResponse(db: D1Database, job: ProductionJob, status = 200) {
+  const events = await db.prepare('SELECT status,reason,actor_id,created_at FROM production_job_events WHERE job_id=?1 ORDER BY rowid').bind(job.id).all();
+  const ledger = await db.prepare('SELECT provider,model,usage_json,actual_microusd,created_at FROM production_cost_ledger WHERE job_id=?1 ORDER BY rowid').bind(job.id).all();
+  return json({ data: { ...job, asset_ids: JSON.parse(String(job.asset_ids)), policy_snapshot: JSON.parse(String(job.policy_snapshot)), provider_snapshot: JSON.parse(String(job.provider_snapshot)), events: events.results, ledger: ledger.results } }, status);
+}
+async function approveBrief(request: Request, db: D1Database, auth: Auth, ideaId: string) {
+  const idea = await db.prepare('SELECT * FROM idea_candidates WHERE id=?1').bind(ideaId).first<{ workspace_id: string; run_id: string; evidence_json: string }>();
+  if (!idea) throw new HttpError(404, 'idea_not_found', 'Idea not found');
+  const member = await providerAccess(request, db, auth, idea.workspace_id);
+  if (member.status !== 'active' || !['owner','admin','editor'].includes(String(member.role))) throw new HttpError(403, 'forbidden', 'Active editors can approve briefs');
+  const run = await db.prepare("SELECT id FROM idea_scout_runs WHERE id=?1 AND workspace_id=?2 AND status='succeeded'").bind(idea.run_id, idea.workspace_id).first();
+  const evidence = JSON.parse(idea.evidence_json);
+  if (!run || !Array.isArray(evidence) || evidence.length === 0) throw new HttpError(409, 'idea_not_eligible', 'A successful evidence-backed Idea Scout candidate is required');
+  const input = await body(request); const content = requiredString(input.content, 'content', 20000);
+  const id = randomId(); const timestamp = now();
+  await db.prepare('INSERT INTO content_briefs (id,workspace_id,idea_id,content,approved_by_user_id,approved_at) VALUES (?1,?2,?3,?4,?5,?6)').bind(id, idea.workspace_id, ideaId, content, auth.user.id, timestamp).run();
+  return json({ data: { id, workspace_id: idea.workspace_id, idea_id: ideaId, content, approved_by_user_id: auth.user.id, approved_at: timestamp } }, 201);
+}
+async function createProduction(request: Request, db: D1Database, auth: Auth, workspaceId: string) {
+  const member = await providerAccess(request, db, auth, workspaceId);
+  if (!['owner','admin','editor'].includes(String(member.role))) throw new HttpError(403, 'forbidden', 'Only editors can start production');
+  const key = requiredString(request.headers.get('Idempotency-Key'), 'Idempotency-Key', 200);
+  const input = await body(request);
+  if (Object.keys(input).some(k => !['brief_id','asset_ids','provider'].includes(k))) throw new ValidationError('Unexpected production field');
+  const brief = requiredString(input.brief_id, 'brief_id', 100); const provider = requiredString(input.provider, 'provider', 80);
+  if (!providerDefinition(provider)) throw new HttpError(422, 'provider_unsupported', 'Unsupported provider');
+  if (!Array.isArray(input.asset_ids) || input.asset_ids.length < 1 || input.asset_ids.length > 100 || input.asset_ids.some(x => typeof x !== 'string' || !x || x.length > 100) || new Set(input.asset_ids).size !== input.asset_ids.length) throw new ValidationError('asset_ids must contain unique asset IDs');
+  const assetIds = [...input.asset_ids].sort() as string[];
+  const hash = await sha256(JSON.stringify({ brief, provider, assetIds }));
+  const existing = await db.prepare('SELECT * FROM production_jobs WHERE workspace_id=?1 AND idempotency_key=?2').bind(workspaceId,key).first<ProductionJob>();
+  if (existing) { if (existing.request_hash !== hash) throw new HttpError(409,'idempotency_conflict','Idempotency key already used'); return productionResponse(db,existing); }
+  const approved = await db.prepare('SELECT id FROM content_briefs WHERE id=?1 AND workspace_id=?2').bind(brief,workspaceId).first();
+  if (!approved) throw new HttpError(422,'brief_not_approved','An approved workspace brief is required');
+  const policy = await db.prepare('SELECT * FROM automation_policies WHERE workspace_id=?1').bind(workspaceId).first<Record<string, unknown>>();
+  if (!policy) throw new HttpError(409,'policy_not_found','Automation policy not found');
+  const connection = await connectionFor(db,workspaceId,provider);
+  const snapshot = { provider, model: connection?.selected_model ?? null, verified_at: connection?.last_verified_at ?? null };
+  let blocker: string | null = null;
+  let enabled: unknown; try { enabled = JSON.parse(String(policy.enabled_capabilities)); } catch { enabled = null; }
+  if (member.status !== 'active' || policy.stop_switch || !Array.isArray(enabled) || !enabled.includes('production')) blocker = 'policy_blocked';
+  for (const assetId of assetIds) {
+    const asset = await db.prepare('SELECT status,scan_status,licensing_status,rights_confirmed,license_type FROM assets WHERE id=?1 AND workspace_id=?2').bind(assetId,workspaceId).first<{status:string;scan_status:string;licensing_status:string;rights_confirmed:number;license_type:string | null}>();
+    if (!asset) throw new HttpError(422,'asset_not_found','A selected asset does not belong to this workspace');
+    if (!blocker && asset.scan_status === 'unavailable') blocker = 'malware_scanner_unavailable';
+    if (!blocker && (asset.licensing_status !== 'valid' || !asset.rights_confirmed || !asset.license_type)) blocker = 'license_invalid';
+    if (!blocker && (asset.status !== 'ready' || asset.scan_status !== 'clean')) blocker = 'asset_not_ready';
+    const expired = await db.prepare('SELECT id FROM asset_references WHERE asset_id=?1 AND expires_at IS NOT NULL AND expires_at<=?2 LIMIT 1').bind(assetId,now()).first();
+    if (!blocker && expired) blocker = 'license_expired';
+  }
+  if (!blocker && !connection?.encrypted_secret) blocker = 'credential_required';
+  if (!blocker && (connection?.status !== 'verified' || !connection.last_verified_at)) blocker = 'connection_not_verified';
+  if (!blocker && (!connection?.selected_model || !modelDefinition(providerDefinition(provider)!,connection.selected_model)?.capabilities.includes('text_generation'))) blocker = 'model_not_selected';
+  const ceiling = ceilingMicros(policy.per_job_cost_limit);
+  if (!blocker) blocker = costBlocker(ceiling, null);
+  // There is no render adapter or price bound. No provider invocation is permitted.
+  const id = randomId(); const timestamp = now();
+  await db.batch([
+    db.prepare("INSERT INTO production_jobs (id,workspace_id,created_by_user_id,brief_id,asset_ids,idempotency_key,request_hash,policy_snapshot,provider_snapshot,ceiling_microusd,estimate_microusd,estimate_reason,status,blocker_code,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,'render_provider_unavailable','blocked',?11,?12,?12) ON CONFLICT(workspace_id,idempotency_key) DO NOTHING").bind(id,workspaceId,auth.user.id,brief,JSON.stringify(assetIds),key,hash,JSON.stringify(policy),JSON.stringify(snapshot),ceiling,blocker,timestamp),
+    db.prepare("INSERT INTO production_job_events (id,job_id,status,reason,actor_id,created_at) SELECT ?1,id,'planning',NULL,?2,?3 FROM production_jobs WHERE id=?4").bind(randomId(),auth.user.id,timestamp,id),
+    db.prepare("INSERT INTO production_job_events (id,job_id,status,reason,actor_id,created_at) SELECT ?1,id,'blocked',blocker_code,?2,?3 FROM production_jobs WHERE id=?4").bind(randomId(),auth.user.id,timestamp,id),
+  ]);
+  const job = await db.prepare('SELECT * FROM production_jobs WHERE workspace_id=?1 AND idempotency_key=?2').bind(workspaceId,key).first<ProductionJob>();
+  if (!job) throw new HttpError(500,'internal_error','Job could not be recorded');
+  if (job.request_hash !== hash) throw new HttpError(409,'idempotency_conflict','Idempotency key already used');
+  return productionResponse(db,job,job.id === id ? 201 : 200);
+}
+async function productionJob(request: Request, db: D1Database, auth: Auth, id: string, cancel: boolean) {
+  const job = await db.prepare('SELECT * FROM production_jobs WHERE id=?1').bind(id).first<ProductionJob>();
+  if (!job) throw new HttpError(404,'production_job_not_found','Production job not found');
+  const member = await providerAccess(request,db,auth,job.workspace_id);
+  if (!cancel) return productionResponse(db,job);
+  if (member.status !== 'active' || !['owner','admin','editor'].includes(String(member.role))) throw new HttpError(403,'forbidden','Only active editors can cancel production');
+  if (!canTransition(job.status as ProductionState,'cancelled')) throw new HttpError(409,'invalid_transition','Job cannot be cancelled');
+  const timestamp = now(); const eventId = randomId();
+  const results = await db.batch([
+    db.prepare("UPDATE production_jobs SET status='cancelled',updated_at=?1 WHERE id=?2 AND status=?3").bind(timestamp,id,job.status),
+    db.prepare("INSERT INTO production_job_events (id,job_id,status,reason,actor_id,created_at) SELECT ?1,id,'cancelled','user_cancelled',?2,?3 FROM production_jobs WHERE id=?4 AND status='cancelled' AND updated_at=?3 AND changes()=1").bind(eventId,auth.user.id,timestamp,id),
+  ]);
+  if (!results[0].meta.changes) throw new HttpError(409,'invalid_transition','Job state changed');
+  return productionResponse(db,(await db.prepare('SELECT * FROM production_jobs WHERE id=?1').bind(id).first<ProductionJob>())!);
+}
+
 export default { async fetch(request: Request, env: Env): Promise<Response> {
   const headers: HeadersInit = {};
   if (env.ALLOWED_ORIGIN) Object.assign(headers, { "access-control-allow-origin": env.ALLOWED_ORIGIN, "access-control-allow-headers": "authorization,content-type,idempotency-key", "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS" });
@@ -303,6 +387,9 @@ export default { async fetch(request: Request, env: Env): Promise<Response> {
     if (path === "/v1/auth/logout" && request.method === "POST") { await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?1").bind(await sha256(auth.token)).run(); return json({ data: { logged_out: true } }, 200, headers); }
     if (path === "/v1/workspaces" && request.method === "GET") return json({ data: await env.DB.prepare("SELECT w.*, m.role FROM workspaces w JOIN memberships m ON m.workspace_id=w.id WHERE m.user_id=?1 AND m.status='active' ORDER BY w.created_at DESC").bind(auth.user.id).all() }, 200, headers);
     if (path === "/v1/workspaces" && request.method === "POST") return await createWorkspace(request, env.DB, auth);
+    const approveBriefMatch = path.match(/^\/v1\/ideas\/([^/]+)\/approve-brief$/); if (approveBriefMatch && request.method === 'POST') return await approveBrief(request,env.DB,auth,approveBriefMatch[1]);
+    const productionCreateMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/production-jobs$/); if (productionCreateMatch && request.method === 'POST') return await createProduction(request,env.DB,auth,productionCreateMatch[1]);
+    const productionMatch = path.match(/^\/v1\/production-jobs\/([^/]+)(?:\/(cancel))?$/); if (productionMatch && ((!productionMatch[2] && request.method === 'GET') || (productionMatch[2] && request.method === 'POST'))) return await productionJob(request,env.DB,auth,productionMatch[1],Boolean(productionMatch[2]));
     const ideaRunsMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/idea-runs$/); if (ideaRunsMatch && request.method === "POST") return await createIdeaRun(request, env.DB, auth, ideaRunsMatch[1]);
     const ideaRunMatch = path.match(/^\/v1\/idea-runs\/([^/]+)$/); if (ideaRunMatch && request.method === "GET") return await getIdeaRun(request, env.DB, auth, ideaRunMatch[1]);
     const assetsMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/assets$/); if (assetsMatch && request.method === "GET") return await listAssets(request, env.DB, auth, assetsMatch[1]);
