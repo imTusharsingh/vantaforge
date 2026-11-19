@@ -1,4 +1,5 @@
 import { canTransition, ceilingMicros, costBlocker, type ProductionState } from './production';
+import { capabilitySnapshots, renderAdapterFor } from './render-adapters';
 import { ideaScoutBlocker } from "./idea-scout";
 import { decryptSecret, encryptSecret, hashPassword, randomId, randomToken, sha256, verifyPassword } from "./crypto";
 import { modelDefinition, PROVIDERS, providerDefinition } from "./providers";
@@ -458,7 +459,9 @@ type ProductionJob = { id: string; workspace_id: string; request_hash: string; s
 async function productionResponse(db: D1Database, job: ProductionJob, status = 200) {
   const events = await db.prepare('SELECT status,reason,actor_id,created_at FROM production_job_events WHERE job_id=?1 ORDER BY rowid').bind(job.id).all();
   const ledger = await db.prepare('SELECT provider,model,usage_json,actual_microusd,created_at FROM production_cost_ledger WHERE job_id=?1 ORDER BY rowid').bind(job.id).all();
-  return json({ data: { ...job, asset_ids: JSON.parse(String(job.asset_ids)), policy_snapshot: JSON.parse(String(job.policy_snapshot)), provider_snapshot: JSON.parse(String(job.provider_snapshot)), events: events.results, ledger: ledger.results } }, status);
+  const attempts = await db.prepare('SELECT id,idempotency_key,provider,status,blocker_code,provider_job_id,output_asset_id,estimate_microusd,actual_microusd,error_code,created_at,updated_at FROM production_render_attempts WHERE production_job_id=?1 ORDER BY rowid').bind(job.id).all();
+  const capabilities = await db.prepare('SELECT provider,capability,status,blocker_code,checked_at FROM production_provider_capabilities WHERE workspace_id=?1 AND provider=?2 ORDER BY capability').bind(job.workspace_id, JSON.parse(String(job.provider_snapshot)).provider ?? '').all();
+  return json({ data: { ...job, asset_ids: JSON.parse(String(job.asset_ids)), policy_snapshot: JSON.parse(String(job.policy_snapshot)), provider_snapshot: JSON.parse(String(job.provider_snapshot)), capabilities: capabilities.results, render_attempts: attempts.results, events: events.results, ledger: ledger.results } }, status);
 }
 
 type QualityRun = { id: string; workspace_id: string; production_job_id: string; created_by_user_id: string; idempotency_key: string; request_hash: string; provider_snapshot: string; policy_snapshot: string; evidence_refs: string; findings: string; score: number | null; status: string; blocker_code: string | null; created_at: string };
@@ -478,7 +481,7 @@ async function createQualityGate(request: Request, db: D1Database, auth: Auth, j
   const policy = await db.prepare('SELECT * FROM automation_policies WHERE workspace_id=?1').bind(job.workspace_id).first<Record<string, unknown>>();
   if (!policy) throw new HttpError(409, 'policy_not_found', 'Automation policy not found');
   const providerSnapshot = JSON.parse(String(job.provider_snapshot)); const assetIds = JSON.parse(String(job.asset_ids)) as string[];
-  const assets = assetIds.length ? await db.prepare(`SELECT id,kind,media_type,duration_seconds,width,height,metadata,status,scan_status,licensing_status,rights_confirmed,license_type FROM assets WHERE workspace_id=?1 AND id IN (${assetIds.map(() => '?').join(',')})`).bind(job.workspace_id, ...assetIds).all<QualityAsset>() : { results: [] as QualityAsset[] };
+  const assets = assetIds.length ? await db.prepare(`SELECT id,storage_key,kind,media_type,duration_seconds,width,height,metadata,status,scan_status,licensing_status,rights_confirmed,license_type FROM assets WHERE workspace_id=?1 AND id IN (${assetIds.map(() => '?').join(',')})`).bind(job.workspace_id, ...assetIds).all<QualityAsset>() : { results: [] as QualityAsset[] };
   const assetMap = new Map(assets.results.map((asset) => [asset.id, asset]));
   const findings: QualityFinding[] = assetIds.filter((id) => !assetMap.has(id)).map((id) => ({ code: 'asset_not_found', severity: 'blocking', message: 'A production asset could not be loaded for review', evidence_refs: [`asset:${id}`] }));
   findings.push(...evaluateDeterministicQuality(job, assetIds.flatMap((id) => assetMap.get(id) ? [assetMap.get(id)!] : []), now()));
@@ -558,12 +561,18 @@ async function createProduction(request: Request, db: D1Database, auth: Auth, wo
   if (!blocker && (!connection?.selected_model || !modelDefinition(providerDefinition(provider)!,connection.selected_model)?.capabilities.includes('text_generation'))) blocker = 'model_not_selected';
   const ceiling = ceilingMicros(policy.per_job_cost_limit);
   if (!blocker) blocker = costBlocker(ceiling, null);
-  // There is no render adapter or price bound. No provider invocation is permitted.
+  const adapter = renderAdapterFor(provider);
+  if (!blocker && !adapter) blocker = 'provider_unavailable';
+  const estimateReason = blocker ?? 'render_estimate_unavailable';
+  // No provider invocation is permitted without an adapter and a bounded estimate.
   const id = randomId(); const timestamp = now();
+  const capabilities = capabilitySnapshots(provider, timestamp);
   await db.batch([
-    db.prepare("INSERT INTO production_jobs (id,workspace_id,created_by_user_id,brief_id,asset_ids,idempotency_key,request_hash,policy_snapshot,provider_snapshot,ceiling_microusd,estimate_microusd,estimate_reason,status,blocker_code,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,'render_provider_unavailable','blocked',?11,?12,?12) ON CONFLICT(workspace_id,idempotency_key) DO NOTHING").bind(id,workspaceId,auth.user.id,brief,JSON.stringify(assetIds),key,hash,JSON.stringify(policy),JSON.stringify(snapshot),ceiling,blocker,timestamp),
+    db.prepare("INSERT INTO production_jobs (id,workspace_id,created_by_user_id,brief_id,asset_ids,idempotency_key,request_hash,policy_snapshot,provider_snapshot,ceiling_microusd,estimate_microusd,estimate_reason,status,blocker_code,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,?11,'blocked',?12,?13,?13) ON CONFLICT(workspace_id,idempotency_key) DO NOTHING").bind(id,workspaceId,auth.user.id,brief,JSON.stringify(assetIds),key,hash,JSON.stringify({ ...snapshot, render_adapter: adapter ? provider : null }),ceiling,estimateReason,blocker,timestamp),
     db.prepare("INSERT INTO production_job_events (id,job_id,status,reason,actor_id,created_at) SELECT ?1,id,'planning',NULL,?2,?3 FROM production_jobs WHERE id=?4").bind(randomId(),auth.user.id,timestamp,id),
     db.prepare("INSERT INTO production_job_events (id,job_id,status,reason,actor_id,created_at) SELECT ?1,id,'blocked',blocker_code,?2,?3 FROM production_jobs WHERE id=?4").bind(randomId(),auth.user.id,timestamp,id),
+    ...capabilities.map((capability) => db.prepare("INSERT INTO production_provider_capabilities (id,workspace_id,provider,capability,status,blocker_code,checked_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(workspace_id,provider,capability) DO UPDATE SET status=excluded.status,blocker_code=excluded.blocker_code,checked_at=excluded.checked_at").bind(randomId(), workspaceId, capability.provider, capability.capability, capability.status, capability.blocker_code, capability.checked_at)),
+    db.prepare("INSERT INTO production_render_attempts (id,workspace_id,production_job_id,idempotency_key,request_hash,provider,status,blocker_code,estimate_microusd,created_at,updated_at) SELECT ?1,workspace_id,id,?2,?3,?4,'blocked',?5,NULL,?6,?6 FROM production_jobs WHERE id=?7 ON CONFLICT(workspace_id,idempotency_key) DO NOTHING").bind(randomId(), `${key}:render`, hash, provider, blocker, timestamp, id),
   ]);
   const job = await db.prepare('SELECT * FROM production_jobs WHERE workspace_id=?1 AND idempotency_key=?2').bind(workspaceId,key).first<ProductionJob>();
   if (!job) throw new HttpError(500,'internal_error','Job could not be recorded');

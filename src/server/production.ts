@@ -18,3 +18,15 @@ export function costBlocker(ceiling: number | null, estimate: number | null, spe
   if (!Number.isSafeInteger(spent) || spent < 0 || estimate === null || !Number.isSafeInteger(estimate) || estimate < 0) return 'cost_estimate_unavailable';
   return spent + estimate > ceiling || !Number.isSafeInteger(spent + estimate) ? 'cost_ceiling_exceeded' : null;
 }
+
+export type RenderAttemptState = 'planned' | 'blocked' | 'submitted' | 'processing' | 'succeeded' | 'failed' | 'cancelled';
+const renderTransitions: Record<RenderAttemptState, RenderAttemptState[]> = {
+  planned: ['blocked', 'submitted', 'cancelled'], blocked: ['cancelled'], submitted: ['processing', 'failed', 'cancelled'], processing: ['succeeded', 'failed', 'cancelled'], succeeded: [], failed: [], cancelled: [],
+};
+export function canTransitionRender(from: RenderAttemptState, to: RenderAttemptState): boolean { return renderTransitions[from]?.includes(to) ?? false; }
+
+export function idempotencyConflict(existingHash: string, requestHash: string): boolean { return existingHash !== requestHash; }
+
+export function workspaceCanRender(role: string, status: string): boolean {
+  return status === 'active' && ['owner', 'admin', 'editor'].includes(role);
+}
