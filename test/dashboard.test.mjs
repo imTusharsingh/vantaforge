@@ -25,6 +25,11 @@ test("resource failures remain explicit and publishing/analytics use declared Wo
   const dashboard = fs.readFileSync(new URL("../dist/dashboard.js", import.meta.url), "utf8");
   assert.match(dashboard, /\/v1\/workspaces\/\$\{id\}\/publishing-connections/);
   assert.match(dashboard, /\/v1\/workspaces\/\$\{id\}\/analytics/);
+  assert.match(dashboard, /Publishing actions unavailable/);
+  assert.match(dashboard, /Fresh analytics unavailable/);
+  assert.doesNotMatch(dashboard, /publishing-connections\/oauth/);
+  assert.doesNotMatch(dashboard, /publishing-connections\/\$\{element\.dataset\.connection\}\/revoke/);
+  assert.doesNotMatch(dashboard, /analytics-runs/);
   assert.doesNotMatch(dashboard, /Promise\.allSettled/);
   assert.doesNotMatch(dashboard, /catch\s*\([^)]*\)\s*\{\s*\[\]/);
 });
