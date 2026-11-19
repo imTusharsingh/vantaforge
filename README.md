@@ -68,6 +68,24 @@ automation policy; other members can read resources. Errors are structured
 without exposing database or credential details. Workspace creation initializes
 an explicit assisted-mode policy, with no mock data or AI fallback involved.
 
+### Private real-footage asset library
+
+Migration [`0003_assets.sql`](./src/server/migrations/0003_assets.sql) adds
+workspace-owned assets and licensing references. Configure the private R2
+bucket in [`wrangler.toml`](./wrangler.toml). Upload intents return only an
+opaque, expiring Worker URL; storage keys remain server-side. Uploads accept
+real video types only, enforce declared bytes, and require a SHA-256 checksum,
+positive duration, and explicit licensing/rights fields at completion.
+
+No real malware scanner is configured in this slice, so completion truthfully
+leaves the asset `status=blocked` with `scan_status=unavailable`; it never
+creates a fake clean scan or ready asset. Metadata and downloads require active
+workspace membership, and downloads are streamed through the Worker only for
+ready assets. Routes are `POST /v1/workspaces/:id/assets/uploads`,
+`PUT /v1/assets/uploads/:id/content?token=...`,
+`POST /v1/assets/:id/complete`, `GET /v1/workspaces/:id/assets`,
+`GET /v1/assets/:id`, and `GET /v1/assets/:id/download`.
+
 Local verification:
 
 ```sh

@@ -2,13 +2,17 @@ import { decryptSecret, encryptSecret, hashPassword, randomId, randomToken, sha2
 import { modelDefinition, PROVIDERS, providerDefinition } from "./providers";
 import { asRecord, email, password, requiredString, slug, ValidationError } from "./validation";
 
-export interface Env { DB: D1Database; ALLOWED_ORIGIN?: string; CREDENTIAL_ENCRYPTION_KEY?: string }
+export interface Env { DB: D1Database; ASSETS?: R2Bucket; ALLOWED_ORIGIN?: string; CREDENTIAL_ENCRYPTION_KEY?: string }
 type User = { id: string; email: string; display_name: string; status: string };
 type Auth = { user: User; token: string };
 
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) => Response.json(body, { status, headers: { "cache-control": "no-store", ...headers } });
 const fail = (status: number, code: string, message: string, details?: Record<string, unknown>) => json({ error: { code, message, ...(details ? { details } : {}) }, request_id: crypto.randomUUID() }, status);
 const now = () => new Date().toISOString();
+const MAX_ASSET_BYTES = 500 * 1024 * 1024;
+const UPLOAD_TTL_MS = 60 * 60 * 1000;
+const VIDEO_TYPES = new Set(["video/mp4", "video/quicktime", "video/webm", "video/x-matroska"]);
+const LICENSE_TYPES = new Set(["owned", "licensed", "public_domain", "cc_by", "cc_by_sa"]);
 
 async function body(request: Request): Promise<Record<string, unknown>> {
   try { return asRecord(await request.json()); } catch (error) { if (error instanceof ValidationError) throw error; throw new ValidationError("Request body must be valid JSON"); }
@@ -176,6 +180,70 @@ async function verifyProvider(request: Request, db: D1Database, auth: Auth, env:
   throw new HttpError(code === "credential_invalid" ? 422 : 503, code, code === "credential_invalid" ? "The provider rejected the credential" : "The provider could not be reached or verified");
 }
 
+type AssetRow = { id: string; workspace_id: string; kind: string; media_type: string; original_filename: string; bytes: number; checksum: string | null; duration_seconds: number | null; width: number | null; height: number | null; metadata: string; license_type: string | null; license_id: string | null; source_url: string | null; rights_confirmed: number; attribution_required: number; attribution_text: string | null; scan_status: string; licensing_status: string; status: string; blocked_reason: string | null; created_by_user_id: string; created_at: string; updated_at: string };
+
+function publicAsset(asset: AssetRow) {
+  return { id: asset.id, workspace_id: asset.workspace_id, kind: asset.kind, media_type: asset.media_type, original_filename: asset.original_filename, bytes: asset.bytes, checksum: asset.checksum, duration_seconds: asset.duration_seconds, dimensions: asset.width && asset.height ? { width: asset.width, height: asset.height } : null, metadata: JSON.parse(asset.metadata), licensing: { type: asset.license_type, id: asset.license_id, source_url: asset.source_url, rights_confirmed: Boolean(asset.rights_confirmed), attribution_required: Boolean(asset.attribution_required), attribution_text: asset.attribution_text }, scan_status: asset.scan_status, licensing_status: asset.licensing_status, status: asset.status, blocked_reason: asset.blocked_reason, created_at: asset.created_at, updated_at: asset.updated_at };
+}
+
+function videoType(value: unknown): string { const mediaType = requiredString(value, "media_type", 120).toLowerCase(); if (!VIDEO_TYPES.has(mediaType)) throw new ValidationError("media_type must be a supported real-video type"); return mediaType; }
+function positiveBytes(value: unknown): number { if (!Number.isInteger(value) || Number(value) < 1 || Number(value) > MAX_ASSET_BYTES) throw new ValidationError(`bytes must be an integer between 1 and ${MAX_ASSET_BYTES}`); return Number(value); }
+function checksum(value: unknown): string { const normalized = requiredString(value, "checksum", 64).toLowerCase(); if (!/^[a-f0-9]{64}$/.test(normalized)) throw new ValidationError("checksum must be a SHA-256 hex digest"); return normalized; }
+function booleanField(value: unknown, field: string): boolean { if (typeof value !== "boolean") throw new ValidationError(`${field} must be a boolean`); return value; }
+
+async function createUploadIntent(request: Request, db: D1Database, auth: Auth, env: Env, workspaceId: string) {
+  if (!env.ASSETS) throw new HttpError(503, "storage_unavailable", "Private asset storage is not configured");
+  await providerAccess(request, db, auth, workspaceId);
+  const input = await body(request); const mediaType = videoType(input.media_type); const bytes = positiveBytes(input.bytes); const filename = requiredString(input.filename, "filename", 255);
+  const id = randomId(); const token = randomToken(); const created = now(); const expires = new Date(Date.now() + UPLOAD_TTL_MS).toISOString(); const storageKey = `workspaces/${workspaceId}/assets/${id}/source`;
+  await db.prepare("INSERT INTO assets (id,workspace_id,storage_key,media_type,original_filename,bytes,upload_token_hash,upload_expires_at,created_by_user_id,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)").bind(id, workspaceId, storageKey, mediaType, filename, bytes, await sha256(token), expires, auth.user.id, created).run();
+  const uploadUrl = new URL(`/v1/assets/uploads/${id}/content`, request.url); uploadUrl.searchParams.set("token", token);
+  return json({ data: { asset_id: id, upload_url: uploadUrl.toString(), expires_at: expires, max_bytes: bytes, media_type: mediaType } }, 201);
+}
+
+async function uploadAssetContent(request: Request, db: D1Database, env: Env, assetId: string) {
+  if (!env.ASSETS) throw new HttpError(503, "storage_unavailable", "Private asset storage is not configured");
+  const token = new URL(request.url).searchParams.get("token"); if (!token) throw new HttpError(401, "upload_token_required", "The upload token is required");
+  const asset = await db.prepare("SELECT id,storage_key,media_type,bytes,upload_expires_at,status,upload_token_hash FROM assets WHERE id=?1").bind(assetId).first<{ id: string; storage_key: string; media_type: string; bytes: number; upload_expires_at: string; status: string; upload_token_hash: string }>();
+  if (!asset || asset.status !== "pending_upload" || asset.upload_expires_at < now() || !(await sha256(token) === asset.upload_token_hash)) throw new HttpError(404, "upload_not_found", "Upload intent not found or expired");
+  if (request.headers.get("content-type")?.split(";", 1)[0].toLowerCase() !== asset.media_type) throw new HttpError(415, "media_type_mismatch", "The uploaded media type does not match the upload intent");
+  const contentLength = Number(request.headers.get("content-length")); if (!Number.isInteger(contentLength) || contentLength !== asset.bytes) throw new HttpError(400, "byte_size_mismatch", "The uploaded byte size does not match the upload intent");
+  const data = await request.arrayBuffer(); if (data.byteLength !== asset.bytes) throw new HttpError(400, "byte_size_mismatch", "The uploaded byte size does not match the upload intent");
+  const digest = await sha256Bytes(data);
+  await env.ASSETS.put(asset.storage_key, data, { httpMetadata: { contentType: asset.media_type }, customMetadata: { checksum: digest } });
+  return json({ data: { asset_id: asset.id, uploaded: true } });
+}
+
+async function sha256Bytes(value: ArrayBuffer): Promise<string> { const digest = await crypto.subtle.digest("SHA-256", value); return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join(""); }
+
+function licensing(input: Record<string, unknown>) {
+  const type = requiredString(input.license_type, "license_type", 40); if (!LICENSE_TYPES.has(type)) throw new ValidationError("license_type is invalid");
+  const rights = booleanField(input.rights_confirmed, "rights_confirmed"); if (!rights) throw new ValidationError("rights_confirmed must be true");
+  const attribution = input.attribution_required === undefined ? false : booleanField(input.attribution_required, "attribution_required");
+  const sourceUrl = input.source_url === undefined ? null : requiredString(input.source_url, "source_url", 2048); const licenseId = input.license_id === undefined ? null : requiredString(input.license_id, "license_id", 255); const attributionText = input.attribution_text === undefined ? null : requiredString(input.attribution_text, "attribution_text", 2000);
+  if (type === "licensed" && !licenseId) throw new ValidationError("license_id is required for licensed footage");
+  return { type, rights: 1, attribution: attribution ? 1 : 0, sourceUrl, licenseId, attributionText };
+}
+
+async function completeAsset(request: Request, db: D1Database, auth: Auth, env: Env, assetId: string) {
+  const asset = await db.prepare("SELECT * FROM assets WHERE id=?1").bind(assetId).first<AssetRow & { storage_key: string; upload_expires_at: string | null }>(); if (!asset) throw new HttpError(404, "asset_not_found", "Asset not found"); await providerAccess(request, db, auth, asset.workspace_id);
+  if (asset.created_by_user_id !== auth.user.id && !["owner", "admin"].includes(String((await workspace(request, db, auth.user.id, asset.workspace_id))?.role))) throw new HttpError(403, "forbidden", "Only the uploader or a workspace owner/admin can complete this upload");
+  if (!env.ASSETS) throw new HttpError(503, "storage_unavailable", "Private asset storage is not configured"); const object = await env.ASSETS.head(asset.storage_key); if (!object) throw new HttpError(409, "upload_incomplete", "Upload content must be stored before completion");
+  if (object.size !== asset.bytes) throw new HttpError(400, "byte_size_mismatch", "Stored object size does not match the upload intent");
+  const input = await body(request); const duration = input.duration_seconds; if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0 || duration > 3600) throw new ValidationError("duration_seconds must be a positive number no greater than 3600"); const suppliedChecksum = checksum(input.checksum); const storedChecksum = object.customMetadata?.checksum; if (!storedChecksum || storedChecksum !== suppliedChecksum) throw new HttpError(400, "checksum_mismatch", "Submitted checksum does not match the uploaded object");
+  const rights = licensing(input); const width = input.width === undefined ? null : positiveDimension(input.width, "width"); const height = input.height === undefined ? null : positiveDimension(input.height, "height"); const metadata = input.metadata === undefined ? {} : asRecord(input.metadata); const references = input.references === undefined ? [] : input.references; if (!Array.isArray(references)) throw new ValidationError("references must be an array");
+  const created = now(); const blockedReason = "malware_scanner_unavailable";
+  await db.batch([db.prepare("UPDATE assets SET checksum=?1,duration_seconds=?2,width=?3,height=?4,metadata=?5,license_type=?6,license_id=?7,source_url=?8,rights_confirmed=?9,attribution_required=?10,attribution_text=?11,scan_status='unavailable',licensing_status='valid',status='blocked',blocked_reason=?12,upload_token_hash=NULL,upload_expires_at=NULL,updated_at=?13 WHERE id=?14").bind(suppliedChecksum, duration, width, height, JSON.stringify(metadata), rights.type, rights.licenseId, rights.sourceUrl, rights.rights, rights.attribution, rights.attributionText, blockedReason, created, assetId), ...references.map((reference) => assetReferenceStatement(db, reference, assetId, created))]);
+  return json({ data: { ...publicAsset({ ...asset, checksum: suppliedChecksum, duration_seconds: duration, width, height, metadata: JSON.stringify(metadata), license_type: rights.type, license_id: rights.licenseId, source_url: rights.sourceUrl, rights_confirmed: rights.rights, attribution_required: rights.attribution, attribution_text: rights.attributionText, scan_status: "unavailable", licensing_status: "valid", status: "blocked", blocked_reason: blockedReason, updated_at: created }), readiness: "blocked", reason: blockedReason } });
+}
+
+function positiveDimension(value: unknown, field: string): number { if (!Number.isInteger(value) || Number(value) < 1 || Number(value) > 100000) throw new ValidationError(`${field} is invalid`); return Number(value); }
+function assetReferenceStatement(db: D1Database, reference: unknown, assetId: string, created: string) { const item = asRecord(reference); const source = requiredString(item.source, "references.source", 120); const sourceUrl = item.source_url === undefined ? null : requiredString(item.source_url, "references.source_url", 2048); const licenseId = item.license_id === undefined ? null : requiredString(item.license_id, "references.license_id", 255); const expiresAt = item.expires_at === undefined ? null : requiredString(item.expires_at, "references.expires_at", 80); const attribution = item.attribution_required === undefined ? false : booleanField(item.attribution_required, "references.attribution_required"); const scope = item.usage_scope === undefined ? null : requiredString(item.usage_scope, "references.usage_scope", 255); return db.prepare("INSERT INTO asset_references (id,asset_id,source,source_url,license_id,expires_at,attribution_required,usage_scope,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)").bind(randomId(), assetId, source, sourceUrl, licenseId, expiresAt, attribution ? 1 : 0, scope, created); }
+
+async function listAssets(request: Request, db: D1Database, auth: Auth, workspaceId: string) { await providerAccess(request, db, auth, workspaceId); const rows = await db.prepare("SELECT id,workspace_id,kind,media_type,original_filename,bytes,checksum,duration_seconds,width,height,metadata,license_type,license_id,source_url,rights_confirmed,attribution_required,attribution_text,scan_status,licensing_status,status,blocked_reason,created_by_user_id,created_at,updated_at FROM assets WHERE workspace_id=?1 ORDER BY created_at DESC").bind(workspaceId).all<AssetRow>(); return json({ data: rows.results.map(publicAsset) }); }
+async function getAsset(request: Request, db: D1Database, auth: Auth, assetId: string) { const asset = await db.prepare("SELECT id,workspace_id,kind,media_type,original_filename,bytes,checksum,duration_seconds,width,height,metadata,license_type,license_id,source_url,rights_confirmed,attribution_required,attribution_text,scan_status,licensing_status,status,blocked_reason,created_by_user_id,created_at,updated_at FROM assets WHERE id=?1").bind(assetId).first<AssetRow>(); if (!asset) throw new HttpError(404, "asset_not_found", "Asset not found"); await providerAccess(request, db, auth, asset.workspace_id); const references = await db.prepare("SELECT id,source,source_url,license_id,expires_at,attribution_required,usage_scope,created_at FROM asset_references WHERE asset_id=?1 ORDER BY created_at ASC").bind(assetId).all(); return json({ data: { ...publicAsset(asset), references: references.results } }); }
+async function downloadAsset(request: Request, db: D1Database, auth: Auth, env: Env, assetId: string) { if (!env.ASSETS) throw new HttpError(503, "storage_unavailable", "Private asset storage is not configured"); const asset = await db.prepare("SELECT id,workspace_id,storage_key,media_type,original_filename,status FROM assets WHERE id=?1").bind(assetId).first<{ id: string; workspace_id: string; storage_key: string; media_type: string; original_filename: string; status: string }>(); if (!asset) throw new HttpError(404, "asset_not_found", "Asset not found"); await providerAccess(request, db, auth, asset.workspace_id); if (asset.status !== "ready") throw new HttpError(409, "asset_not_ready", "This asset is not ready for download"); const object = await env.ASSETS.get(asset.storage_key); if (!object) throw new HttpError(404, "asset_content_not_found", "Asset content not found"); return new Response(object.body, { headers: { "cache-control": "private, no-store", "content-type": asset.media_type, "content-disposition": `inline; filename="${asset.original_filename.replaceAll(/["\\\r\n]/g, "_")}"` } }); }
+
 export default { async fetch(request: Request, env: Env): Promise<Response> {
   const headers: HeadersInit = {};
   if (env.ALLOWED_ORIGIN) Object.assign(headers, { "access-control-allow-origin": env.ALLOWED_ORIGIN, "access-control-allow-headers": "authorization,content-type", "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS" });
@@ -185,11 +253,15 @@ export default { async fetch(request: Request, env: Env): Promise<Response> {
     if (path === "/health" && request.method === "GET") return json({ data: { status: "ok" } }, 200, headers);
     if (path === "/v1/auth/signup" && request.method === "POST") return await signup(request, env.DB);
     if (path === "/v1/auth/login" && request.method === "POST") return await login(request, env.DB);
+    const uploadContentMatch = path.match(/^\/v1\/assets\/uploads\/([^/]+)\/content$/); if (uploadContentMatch && request.method === "PUT") return await uploadAssetContent(request, env.DB, env, uploadContentMatch[1]);
     const auth = requireAuth(await authenticate(request, env.DB));
     if (path === "/v1/auth/me" && request.method === "GET") return json({ data: { user: auth.user } }, 200, headers);
     if (path === "/v1/auth/logout" && request.method === "POST") { await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?1").bind(await sha256(auth.token)).run(); return json({ data: { logged_out: true } }, 200, headers); }
     if (path === "/v1/workspaces" && request.method === "GET") return json({ data: await env.DB.prepare("SELECT w.*, m.role FROM workspaces w JOIN memberships m ON m.workspace_id=w.id WHERE m.user_id=?1 AND m.status='active' ORDER BY w.created_at DESC").bind(auth.user.id).all() }, 200, headers);
     if (path === "/v1/workspaces" && request.method === "POST") return await createWorkspace(request, env.DB, auth);
+    const assetsMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/assets$/); if (assetsMatch && request.method === "GET") return await listAssets(request, env.DB, auth, assetsMatch[1]);
+    const uploadIntentMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/assets\/uploads$/); if (uploadIntentMatch && request.method === "POST") return await createUploadIntent(request, env.DB, auth, env, uploadIntentMatch[1]);
+    const assetMatch = path.match(/^\/v1\/assets\/([^/]+)(?:\/(complete|download))?$/); if (assetMatch) { if (!assetMatch[2] && request.method === "GET") return await getAsset(request, env.DB, auth, assetMatch[1]); if (assetMatch[2] === "complete" && request.method === "POST") return await completeAsset(request, env.DB, auth, env, assetMatch[1]); if (assetMatch[2] === "download" && request.method === "GET") return await downloadAsset(request, env.DB, auth, env, assetMatch[1]); }
     const providerListMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/ai-providers$/);
     if (providerListMatch && request.method === "GET") return await listProviders(request, env.DB, auth, providerListMatch[1]);
     const providerModelsMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/ai-providers\/models$/);
