@@ -156,3 +156,23 @@ The value must be a 32-byte base64 secret or a 64-character hexadecimal
 secret. Credentials are encrypted with Web Crypto AES-GCM before D1 storage.
 Apply [`0002_ai_provider_settings.sql`](./src/server/migrations/0002_ai_provider_settings.sql)
 after the identity migration.
+
+## Idea Scout runs
+
+Apply migration [`0004_idea_scout.sql`](./src/server/migrations/0004_idea_scout.sql)
+after the earlier migrations. Owners, admins, and editors can submit
+`POST /v1/workspaces/:id/idea-runs` with an `Idempotency-Key` header and JSON
+`{"provider":"openai"}` (or another catalogued provider). Active members can
+read `GET /v1/idea-runs/:id`. Enable `idea_discovery` in the workspace policy;
+the stop switch and suspended workspace block new runs. The selected provider
+must have a stored, verified credential and selected text-generation model.
+The response records the policy and provider/model snapshot and a typed blocker;
+it never includes credentials. The same key and request return the original run;
+a changed request returns `idempotency_conflict`. After correcting a blocker,
+submit a new key to create a new attempt.
+
+No external trend source or Idea Scout generation adapter is implemented yet.
+Even a verified provider therefore produces `trend_source_unavailable`, no
+ideas, and null usage and cost. No provider call or spend occurs in this slice.
+Real evidence collection, generation, and provider-reported usage are required
+before runs can succeed; no trends or candidates are synthesized.
