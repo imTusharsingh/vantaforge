@@ -33,6 +33,7 @@ CREATE TABLE automation_runs (
   next_attempt_at TEXT,
   lease_owner TEXT,
   lease_expires_at TEXT,
+  lease_fence INTEGER NOT NULL DEFAULT 0,
   cancel_requested_at TEXT,
   started_at TEXT,
   completed_at TEXT,
@@ -58,6 +59,7 @@ CREATE TABLE automation_run_steps (
   next_attempt_at TEXT,
   lease_owner TEXT,
   lease_expires_at TEXT,
+  lease_fence INTEGER NOT NULL DEFAULT 0,
   started_at TEXT,
   completed_at TEXT,
   created_at TEXT NOT NULL,
@@ -107,6 +109,8 @@ CREATE TABLE automation_review_checkpoints (
   created_at TEXT NOT NULL,
   UNIQUE (run_id, step_id, kind, counter_version)
 );
+CREATE UNIQUE INDEX automation_assisted_checkpoint_unique
+  ON automation_review_checkpoints(run_id,step_id,kind) WHERE kind='assisted';
 CREATE TRIGGER automation_review_checkpoints_no_update BEFORE UPDATE ON automation_review_checkpoints BEGIN SELECT RAISE(ABORT, 'immutable automation review checkpoint'); END;
 CREATE TRIGGER automation_review_checkpoints_no_delete BEFORE DELETE ON automation_review_checkpoints BEGIN SELECT RAISE(ABORT, 'immutable automation review checkpoint'); END;
 
@@ -134,3 +138,14 @@ CREATE TABLE automation_budget_reservations (
   UNIQUE (step_id)
 );
 CREATE INDEX automation_budget_reservations_account_idx ON automation_budget_reservations(workspace_id,budget_date,status);
+
+CREATE TABLE automation_publish_claims (
+  publish_request_id TEXT PRIMARY KEY NOT NULL REFERENCES publish_requests(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL REFERENCES automation_runs(id) ON DELETE CASCADE,
+  step_id TEXT NOT NULL REFERENCES automation_run_steps(id) ON DELETE CASCADE,
+  lease_fence INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('claimed','completed')),
+  claimed_at TEXT NOT NULL,
+  completed_at TEXT,
+  UNIQUE(step_id)
+);

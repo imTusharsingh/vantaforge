@@ -130,6 +130,11 @@ Schedule control is owner/admin-only; active editors may cancel non-terminal
 runs. All visibility remains membership-scoped. Provider credentials remain
 user-owned and are never placed in scheduler configuration.
 
+The authenticated dashboard Automation view reads these schedule/run APIs and
+shows upcoming, running, blocked, completed, and cancelled work with explicit
+loading, error, and empty states. Its pause, resume, cancel, and approve buttons
+invoke only the routes listed above.
+
 ## AI provider settings
 
 Provider credentials are workspace-scoped and write-only. Before using these
