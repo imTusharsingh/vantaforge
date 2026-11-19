@@ -355,3 +355,17 @@ workspace policy, missing or unverified user-owned provider credentials/model,
 missing ceiling, and unavailable render pricing/provider. No AI credential is
 read from configuration or stored in a job snapshot. No output asset, URL,
 usage, or price is fabricated.
+
+## Implemented quality-gate boundary
+
+Migration `0006_quality_gate.sql` adds immutable quality-gate runs and decision
+history. The run endpoint records deterministic checks for real footage,
+duration/aspect, audio/captions, rights/licensing, and production state, with
+evidence references and a nullable score. The AI handoff snapshots only the
+workspace's encrypted connection status, verified time, and selected model;
+missing verified credentials, unsupported capabilities, and the absent media
+inspection adapter are typed blockers. No provider call, transcript,
+thumbnail, score, finding, usage, or approval is synthesized. A database
+trigger prevents a production job from reaching `completed` without a passed
+quality gate, while existing immutable cost-ledger and ceiling rules remain in
+force.

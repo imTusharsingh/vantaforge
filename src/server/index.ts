@@ -3,6 +3,7 @@ import { ideaScoutBlocker } from "./idea-scout";
 import { decryptSecret, encryptSecret, hashPassword, randomId, randomToken, sha256, verifyPassword } from "./crypto";
 import { modelDefinition, PROVIDERS, providerDefinition } from "./providers";
 import { asRecord, email, password, requiredString, slug, ValidationError } from "./validation";
+import { evaluateDeterministicQuality, qualityScore, type QualityAsset, type QualityFinding } from './quality';
 
 export interface Env { DB: D1Database; ASSETS?: R2Bucket; ALLOWED_ORIGIN?: string; CREDENTIAL_ENCRYPTION_KEY?: string }
 type User = { id: string; email: string; display_name: string; status: string };
@@ -295,6 +296,55 @@ async function productionResponse(db: D1Database, job: ProductionJob, status = 2
   const ledger = await db.prepare('SELECT provider,model,usage_json,actual_microusd,created_at FROM production_cost_ledger WHERE job_id=?1 ORDER BY rowid').bind(job.id).all();
   return json({ data: { ...job, asset_ids: JSON.parse(String(job.asset_ids)), policy_snapshot: JSON.parse(String(job.policy_snapshot)), provider_snapshot: JSON.parse(String(job.provider_snapshot)), events: events.results, ledger: ledger.results } }, status);
 }
+
+type QualityRun = { id: string; workspace_id: string; production_job_id: string; created_by_user_id: string; idempotency_key: string; request_hash: string; provider_snapshot: string; policy_snapshot: string; evidence_refs: string; findings: string; score: number | null; status: string; blocker_code: string | null; created_at: string };
+function publicQualityRun(run: QualityRun, decisions: unknown[]) { return { id: run.id, workspace_id: run.workspace_id, production_job_id: run.production_job_id, status: run.status, score: run.score, blocker: run.blocker_code ? { code: run.blocker_code, retryable: false } : null, provider_snapshot: JSON.parse(run.provider_snapshot), policy_snapshot: JSON.parse(run.policy_snapshot), evidence_refs: JSON.parse(run.evidence_refs), findings: JSON.parse(run.findings), decisions, created_at: run.created_at }; }
+async function qualityGateResponse(db: D1Database, run: QualityRun, status = 200) { const decisions = await db.prepare('SELECT id,decision,reviewer_id,reason,created_at FROM quality_gate_decisions WHERE quality_gate_run_id=?1 ORDER BY rowid').bind(run.id).all(); return json({ data: publicQualityRun(run, decisions.results) }, status); }
+
+async function createQualityGate(request: Request, db: D1Database, auth: Auth, jobId: string) {
+  const job = await db.prepare('SELECT * FROM production_jobs WHERE id=?1').bind(jobId).first<ProductionJob>();
+  if (!job) throw new HttpError(404, 'production_job_not_found', 'Production job not found');
+  const member = await providerAccess(request, db, auth, String(job.workspace_id));
+  if (!['owner', 'admin', 'editor', 'reviewer'].includes(String(member.role))) throw new HttpError(403, 'forbidden', 'Only workspace reviewers can start a quality gate');
+  const key = requiredString(request.headers.get('Idempotency-Key'), 'Idempotency-Key', 200); const input = await body(request);
+  if (Object.keys(input).length) throw new ValidationError('Quality gate requests do not accept body fields');
+  const hash = await sha256(JSON.stringify({ production_job_id: jobId }));
+  const existing = await db.prepare('SELECT * FROM quality_gate_runs WHERE workspace_id=?1 AND idempotency_key=?2').bind(job.workspace_id, key).first<QualityRun>();
+  if (existing) { if (existing.request_hash !== hash) throw new HttpError(409, 'idempotency_conflict', 'Idempotency key was used for a different quality gate request'); return qualityGateResponse(db, existing); }
+  const policy = await db.prepare('SELECT * FROM automation_policies WHERE workspace_id=?1').bind(job.workspace_id).first<Record<string, unknown>>();
+  if (!policy) throw new HttpError(409, 'policy_not_found', 'Automation policy not found');
+  const providerSnapshot = JSON.parse(String(job.provider_snapshot)); const assetIds = JSON.parse(String(job.asset_ids)) as string[];
+  const assets = assetIds.length ? await db.prepare(`SELECT id,kind,media_type,duration_seconds,width,height,metadata,status,scan_status,licensing_status,rights_confirmed,license_type FROM assets WHERE workspace_id=?1 AND id IN (${assetIds.map(() => '?').join(',')})`).bind(job.workspace_id, ...assetIds).all<QualityAsset>() : { results: [] as QualityAsset[] };
+  const assetMap = new Map(assets.results.map((asset) => [asset.id, asset]));
+  const findings: QualityFinding[] = assetIds.filter((id) => !assetMap.has(id)).map((id) => ({ code: 'asset_not_found', severity: 'blocking', message: 'A production asset could not be loaded for review', evidence_refs: [`asset:${id}`] }));
+  findings.push(...evaluateDeterministicQuality(job, assetIds.flatMap((id) => assetMap.get(id) ? [assetMap.get(id)!] : []), now()));
+  let blocker: string | null = findings.some((item) => item.severity === 'blocking') ? 'quality_checks_failed' : null;
+  let status = blocker ? 'failed' : 'blocked';
+  if (!blocker && (member.status !== 'active' || Boolean(policy.stop_switch))) blocker = 'policy_blocked';
+  const connection = providerSnapshot.provider ? await connectionFor(db, String(job.workspace_id), String(providerSnapshot.provider)) : null;
+  const provider = providerSnapshot.provider ? providerDefinition(String(providerSnapshot.provider)) : undefined;
+  const snapshotModel = typeof providerSnapshot.model === 'string' ? providerSnapshot.model : null;
+  const model = snapshotModel && provider ? modelDefinition(provider, snapshotModel) : undefined;
+  if (!blocker && (!connection?.encrypted_secret || connection.status !== 'verified' || !connection.last_verified_at)) blocker = 'quality_provider_unavailable';
+  if (!blocker && (!model || !model.capabilities.includes('vision'))) blocker = 'quality_model_capability_unavailable';
+  if (!blocker) blocker = 'media_inspection_capability_unavailable';
+  const timestamp = now(); const id = randomId(); const evidenceRefs = [...new Set(findings.flatMap((item) => item.evidence_refs))];
+  await db.prepare("INSERT INTO quality_gate_runs (id,workspace_id,production_job_id,created_by_user_id,idempotency_key,request_hash,provider_snapshot,policy_snapshot,evidence_refs,findings,score,status,blocker_code,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) ON CONFLICT(workspace_id,idempotency_key) DO NOTHING").bind(id, job.workspace_id, jobId, auth.user.id, key, hash, JSON.stringify({ provider: providerSnapshot.provider ?? null, model: snapshotModel, verified_at: providerSnapshot.verified_at ?? null }), JSON.stringify(policy), JSON.stringify(evidenceRefs), JSON.stringify(findings), blocker ? null : qualityScore(findings), status, blocker, timestamp).run();
+  const run = await db.prepare('SELECT * FROM quality_gate_runs WHERE workspace_id=?1 AND idempotency_key=?2').bind(job.workspace_id, key).first<QualityRun>();
+  if (!run) throw new HttpError(500, 'internal_error', 'Quality gate could not be recorded');
+  if (run.request_hash !== hash) throw new HttpError(409, 'idempotency_conflict', 'Idempotency key was used for a different quality gate request');
+  return qualityGateResponse(db, run, run.id === id ? 201 : 200);
+}
+
+async function getQualityGate(request: Request, db: D1Database, auth: Auth, id: string) { const run = await db.prepare('SELECT * FROM quality_gate_runs WHERE id=?1').bind(id).first<QualityRun>(); if (!run) throw new HttpError(404, 'quality_gate_not_found', 'Quality gate run not found'); await providerAccess(request, db, auth, run.workspace_id); return qualityGateResponse(db, run); }
+async function qualityDecision(request: Request, db: D1Database, auth: Auth, id: string) {
+  const run = await db.prepare('SELECT * FROM quality_gate_runs WHERE id=?1').bind(id).first<QualityRun>(); if (!run) throw new HttpError(404, 'quality_gate_not_found', 'Quality gate run not found');
+  const member = await providerAccess(request, db, auth, run.workspace_id); if (!['owner', 'admin', 'reviewer'].includes(String(member.role))) throw new HttpError(403, 'forbidden', 'Only workspace reviewers can decide a quality gate');
+  const input = await body(request); const decision = requiredString(input.decision, 'decision', 20); if (!['approved', 'rejected'].includes(decision)) throw new ValidationError('decision must be approved or rejected');
+  const reason = input.reason === undefined ? null : requiredString(input.reason, 'reason', 2000); if (decision === 'approved' && (run.status !== 'passed' || run.score === null)) throw new HttpError(409, 'quality_gate_not_passed', 'Only a successful quality gate with a real score can be approved');
+  if (await db.prepare('SELECT id FROM quality_gate_decisions WHERE quality_gate_run_id=?1').bind(id).first()) throw new HttpError(409, 'decision_already_recorded', 'A quality gate decision is immutable and already exists');
+  await db.prepare('INSERT INTO quality_gate_decisions (id,quality_gate_run_id,workspace_id,decision,reviewer_id,reason,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)').bind(randomId(), id, run.workspace_id, decision, auth.user.id, reason, now()).run(); return qualityGateResponse(db, run, 201);
+}
 async function approveBrief(request: Request, db: D1Database, auth: Auth, ideaId: string) {
   const idea = await db.prepare('SELECT * FROM idea_candidates WHERE id=?1').bind(ideaId).first<{ workspace_id: string; run_id: string; evidence_json: string }>();
   if (!idea) throw new HttpError(404, 'idea_not_found', 'Idea not found');
@@ -390,6 +440,9 @@ export default { async fetch(request: Request, env: Env): Promise<Response> {
     const approveBriefMatch = path.match(/^\/v1\/ideas\/([^/]+)\/approve-brief$/); if (approveBriefMatch && request.method === 'POST') return await approveBrief(request,env.DB,auth,approveBriefMatch[1]);
     const productionCreateMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/production-jobs$/); if (productionCreateMatch && request.method === 'POST') return await createProduction(request,env.DB,auth,productionCreateMatch[1]);
     const productionMatch = path.match(/^\/v1\/production-jobs\/([^/]+)(?:\/(cancel))?$/); if (productionMatch && ((!productionMatch[2] && request.method === 'GET') || (productionMatch[2] && request.method === 'POST'))) return await productionJob(request,env.DB,auth,productionMatch[1],Boolean(productionMatch[2]));
+    const qualityCreateMatch = path.match(/^\/v1\/production-jobs\/([^/]+)\/quality-gate$/); if (qualityCreateMatch && request.method === 'POST') return await createQualityGate(request, env.DB, auth, qualityCreateMatch[1]);
+    const qualityDecisionMatch = path.match(/^\/v1\/quality-gates\/([^/]+)\/decision$/); if (qualityDecisionMatch && request.method === 'POST') return await qualityDecision(request, env.DB, auth, qualityDecisionMatch[1]);
+    const qualityMatch = path.match(/^\/v1\/quality-gates\/([^/]+)$/); if (qualityMatch && request.method === 'GET') return await getQualityGate(request, env.DB, auth, qualityMatch[1]);
     const ideaRunsMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/idea-runs$/); if (ideaRunsMatch && request.method === "POST") return await createIdeaRun(request, env.DB, auth, ideaRunsMatch[1]);
     const ideaRunMatch = path.match(/^\/v1\/idea-runs\/([^/]+)$/); if (ideaRunMatch && request.method === "GET") return await getIdeaRun(request, env.DB, auth, ideaRunMatch[1]);
     const assetsMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/assets$/); if (assetsMatch && request.method === "GET") return await listAssets(request, env.DB, auth, assetsMatch[1]);

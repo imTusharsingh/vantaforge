@@ -200,3 +200,23 @@ blocker and an estimate reason. Idea Scout currently cannot create successful
 candidates, and the asset scanner is unavailable; these upstream capabilities,
 a real renderer, provider credentials, and bounded pricing are required before
 production can proceed. See `docs/architecture.md` for the state and cost contract.
+
+### Quality Gate and cost ledger boundary
+
+Apply [`0006_quality_gate.sql`](./src/server/migrations/0006_quality_gate.sql)
+after the production migration. `POST /v1/production-jobs/:id/quality-gate`
+records an immutable run and requires an `Idempotency-Key`; `GET
+/v1/quality-gates/:id` reads the run and decision history; and `POST
+/v1/quality-gates/:id/decision` records one immutable reviewer decision.
+
+The run checks real video assets, 0–60 second duration, the 9:16 aspect range,
+explicit audio/caption readiness, scan/licensing/rights readiness, and whether
+the job is in `rendering` or `awaiting_review`. Findings include evidence
+references and no score is returned when a check blocks. A clean deterministic
+run still fails closed with `media_inspection_capability_unavailable`: there is
+no media inspection adapter in this repository, so no transcript, thumbnail,
+AI score, finding, usage, or approval is fabricated. Provider handoff requires
+the workspace's encrypted, live-verified credential and selected vision model.
+Production completion is protected by the migration trigger requiring a passed
+quality gate; the existing immutable cost ledger and unknown-cost blocker remain
+unchanged, so no billable AI call can bypass the ceiling.
