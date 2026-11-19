@@ -89,7 +89,7 @@ ready assets. Routes are `POST /v1/workspaces/:id/assets/uploads`,
 Local verification:
 
 ```sh
-pnpm install
+pnpm install --frozen-lockfile
 pnpm run check
 pnpm exec wrangler d1 migrations apply vantaforge --local
 pnpm exec wrangler dev
