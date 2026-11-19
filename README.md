@@ -76,3 +76,65 @@ npm run check
 npx wrangler d1 migrations apply vantaforge --local
 npx wrangler dev
 ```
+
+## AI provider settings
+
+Provider credentials are workspace-scoped and write-only. Before using these
+routes, configure the dedicated encryption secret with Wrangler:
+
+```sh
+npx wrangler secret put CREDENTIAL_ENCRYPTION_KEY
+```
+
+This is an encryption key for VantaForge, not an AI provider key. Users submit
+their own provider key through the settings API; only encrypted AES-GCM
+ciphertext is stored. The API never returns the raw key or ciphertext.
+
+The provider routes are:
+
+- `GET /v1/workspaces/:id/ai-providers` — catalog plus connection status.
+- `GET /v1/workspaces/:id/ai-providers/models?provider=openai` — supported models.
+- `PUT/DELETE /v1/workspaces/:id/ai-providers/:provider/credentials` — save or remove a key.
+- `POST /v1/workspaces/:id/ai-providers/:provider/verify` — perform a real provider verification.
+- `PATCH /v1/workspaces/:id/ai-providers/:provider/models` — select a model after verification.
+
+Missing encryption configuration, missing credentials, invalid keys, unsupported
+models, and providers without a live adapter are explicit errors. No provider
+response or generated content is mocked.
+
+## AI provider settings API
+
+AI provider settings are workspace-scoped. Owners and admins can manage them
+using an authenticated session. The API never returns an API key or its
+ciphertext:
+
+```text
+GET    /v1/workspaces/:workspace_id/ai-providers
+GET    /v1/workspaces/:workspace_id/ai-providers/models?provider=openai
+PUT    /v1/workspaces/:workspace_id/ai-providers/:provider/credentials
+DELETE /v1/workspaces/:workspace_id/ai-providers/:provider/credentials
+POST   /v1/workspaces/:workspace_id/ai-providers/:provider/verify
+PATCH  /v1/workspaces/:workspace_id/ai-providers/:provider/models
+```
+
+Credential writes accept `{ "api_key": "..." }` once and return only
+configuration status. Model selection is restricted to the catalog and is
+blocked until the connection has been live-verified. `openai` has a real
+`GET /v1/models` verification adapter; `anthropic` is catalogued but returns a
+truthful unverified response until an adapter is implemented. Provider errors,
+missing credentials, unsupported models, unavailable providers, and missing
+encryption configuration are returned as typed errors rather than mock
+successes.
+
+Set the dedicated encryption secret before using credential routes. It is not
+an AI provider key and must not be placed in source control or ordinary
+configuration:
+
+```sh
+npx wrangler secret put CREDENTIAL_ENCRYPTION_KEY
+```
+
+The value must be a 32-byte base64 secret or a 64-character hexadecimal
+secret. Credentials are encrypted with Web Crypto AES-GCM before D1 storage.
+Apply [`0002_ai_provider_settings.sql`](./src/server/migrations/0002_ai_provider_settings.sql)
+after the identity migration.

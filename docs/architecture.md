@@ -123,6 +123,20 @@ ProviderCapability { provider, capability, model, region, availability,
 ProviderSnapshot { connections, selected_models, capabilities, captured_at }
 ```
 
+The first settings implementation persists one connection per provider and
+workspace in `ai_provider_connections`. The `encrypted_secret` column contains
+only AES-GCM output (a random 12-byte IV followed by ciphertext and tag). The
+AES key comes from the dedicated `CREDENTIAL_ENCRYPTION_KEY` runtime secret
+binding; no provider key is read from an environment variable. Invalid or
+missing encryption configuration is a typed hard error.
+
+The allowlist currently contains OpenAI (`gpt-4o-mini`, `gpt-4o`, and
+`gpt-4.1-mini`) and Anthropic (`claude-3-5-sonnet-latest`). OpenAI is the only
+provider with a live adapter in this slice and is verified with its models
+endpoint. Anthropic remains explicitly unverified until a real adapter exists;
+the Worker never fabricates a verification result. A connection cannot select
+a model until it is verified.
+
 Credential kinds are provider-specific: user API key, OAuth access/refresh
 token, or workload identity. Each adapter declares required credential type,
 scopes, models, regions, payload limits, timeout, and retry policy. A
@@ -214,7 +228,7 @@ use IDs and immutable snapshots, never shared provider secrets.
 | Quality Gate | `POST /v1/production-jobs/{id}/quality-gate`; `GET /v1/quality-gates/{id}`; `POST /v1/quality-gates/{id}/decision` | Checks, findings, policy/human decision |
 | Publishing | `POST /v1/workspaces/{id}/connections`; `POST /v1/publish-requests`; `POST /v1/publish-requests/{id}/cancel` | Verified connections and idempotent side effects |
 | Analytics | `POST /v1/published-posts/{id}/analytics-sync`; `GET /v1/workspaces/{id}/analytics`; `POST /v1/experiment-suggestions` | Provider snapshots and evidence-based suggestions |
-| AI settings | `GET /v1/workspaces/{id}/ai-providers`; `PUT /v1/ai-providers/{id}/credentials`; `POST /v1/ai-providers/{id}/verify`; `PATCH /v1/ai-providers/{id}/models` | Encrypted credentials and capability/model allowlist |
+| AI settings | `GET /v1/workspaces/{id}/ai-providers`; `GET /v1/workspaces/{id}/ai-providers/models`; `PUT|DELETE /v1/workspaces/{id}/ai-providers/{provider}/credentials`; `POST /v1/workspaces/{id}/ai-providers/{provider}/verify`; `PATCH /v1/workspaces/{id}/ai-providers/{provider}/models` | Encrypted credentials and capability/model allowlist |
 
 Mutations creating jobs, credentials, connections, or platform effects require
 `Idempotency-Key`. Job endpoints expose status and permitted cancellation, not
@@ -252,3 +266,18 @@ owners/admins can update workspace settings or patch its policy. Policy updates
 validate mode, review mode, and the stop switch, and increment the policy
 version. No AI credentials, provider calls, mock records, or synthetic fallback
 behavior are part of this module.
+
+## Implemented provider-settings slice
+
+Migration `0002_ai_provider_settings.sql` stores one workspace-scoped provider
+connection per provider. `CREDENTIAL_ENCRYPTION_KEY` is a dedicated runtime
+secret used only to encrypt/decrypt user credentials with AES-GCM; it is not an
+AI provider key and is never returned by the API. Raw keys and ciphertext are
+write-only from the application boundary.
+
+The current catalog exposes OpenAI and Anthropic models. OpenAI verification
+uses a real `GET /v1/models` request. Catalog entries without a live adapter
+return `provider_unverified`; they do not pretend the credential works. Model
+selection is allowed only after a connection is verified. Missing keys,
+unsupported models, invalid credentials, and missing encryption configuration
+produce typed hard errors.
