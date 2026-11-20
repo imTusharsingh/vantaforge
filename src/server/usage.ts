@@ -1,4 +1,4 @@
-export type UsageBlocker = 'billing_unavailable' | 'entitlement_unavailable' | 'cost_evidence_unavailable' | 'usage_budget_exceeded';
+export type UsageBlocker = 'billing_unavailable' | 'entitlement_unavailable' | 'cost_evidence_unavailable' | 'usage_budget_exceeded' | 'idempotency_conflict';
 export type UsageResult = { ok: true; reservation_id: string; replay: boolean } | { ok: false; code: UsageBlocker };
 
 type Account = { period_start: string; period_end: string; budget_microusd: number; reserved_microusd: number; settled_microusd: number };
@@ -9,20 +9,31 @@ export async function reserveUsage(db: D1Database, input: { workspaceId: string;
   if (!entitlement) return { ok:false, code:'billing_unavailable' };
   if (!Number.isSafeInteger(input.estimateMicrousd) || input.estimateMicrousd < 0) return { ok:false, code:'cost_evidence_unavailable' };
   const existing = await db.prepare('SELECT id,request_hash FROM usage_reservations WHERE workspace_id=?1 AND idempotency_key=?2').bind(input.workspaceId,input.idempotencyKey).first<{id:string;request_hash:string}>();
-  if (existing) return existing.request_hash===input.requestHash ? {ok:true,reservation_id:existing.id,replay:true} : {ok:false,code:'usage_budget_exceeded'};
+  if (existing) return existing.request_hash===input.requestHash ? {ok:true,reservation_id:existing.id,replay:true} : {ok:false,code:'idempotency_conflict'};
   const account = await db.prepare('SELECT * FROM usage_period_accounts WHERE workspace_id=?1 AND user_id=?2 AND period_start<=?3 AND period_end>?3').bind(input.workspaceId,input.userId,input.at).first<Account>();
   if (!account) return {ok:false,code:'entitlement_unavailable'};
-  const changed = await db.prepare('UPDATE usage_period_accounts SET reserved_microusd=reserved_microusd+?1,version=version+1,updated_at=?2 WHERE workspace_id=?3 AND user_id=?4 AND period_start=?5 AND reserved_microusd+settled_microusd+?1<=budget_microusd').bind(input.estimateMicrousd,input.at,input.workspaceId,input.userId,account.period_start).run();
-  if (!changed.meta.changes) return {ok:false,code:'usage_budget_exceeded'};
-  await db.batch([db.prepare('INSERT INTO usage_reservations(id,workspace_id,user_id,period_start,idempotency_key,boundary,estimate_microusd,status,request_hash,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,\'reserved\',?8,?9,?9)').bind(input.id,input.workspaceId,input.userId,account.period_start,input.idempotencyKey,input.boundary,input.estimateMicrousd,input.requestHash,input.at),db.prepare('INSERT INTO usage_ledger(id,reservation_id,workspace_id,user_id,kind,amount_microusd,uncertainty,detail,created_at) VALUES(?1,?2,?3,?4,\'reserve\',?5,\'estimated\',?6,?7)').bind(input.ledgerId,input.id,input.workspaceId,input.userId,input.estimateMicrousd,JSON.stringify({boundary:input.boundary}),input.at)]);
-  return {ok:true,reservation_id:input.id,replay:false};
+  try {
+    // D1 batches are transactional. Claim the idempotency key before touching
+    // the account, then mutate account and ledger in that same transaction.
+    const result=await db.batch([
+      db.prepare("INSERT INTO usage_reservations(id,workspace_id,user_id,period_start,idempotency_key,boundary,estimate_microusd,status,request_hash,created_at,updated_at) SELECT ?1,?2,?3,?4,?5,?6,?7,'reserved',?8,?9,?9 WHERE EXISTS(SELECT 1 FROM usage_period_accounts WHERE workspace_id=?2 AND user_id=?3 AND period_start=?4 AND reserved_microusd+settled_microusd+?7<=budget_microusd)").bind(input.id,input.workspaceId,input.userId,account.period_start,input.idempotencyKey,input.boundary,input.estimateMicrousd,input.requestHash,input.at),
+      db.prepare('UPDATE usage_period_accounts SET reserved_microusd=reserved_microusd+?1,version=version+1,updated_at=?2 WHERE workspace_id=?3 AND user_id=?4 AND period_start=?5 AND EXISTS(SELECT 1 FROM usage_reservations WHERE id=?6 AND status=\'reserved\')').bind(input.estimateMicrousd,input.at,input.workspaceId,input.userId,account.period_start,input.id),
+      db.prepare("INSERT INTO usage_ledger(id,reservation_id,workspace_id,user_id,kind,amount_microusd,uncertainty,detail,created_at) SELECT ?1,?2,?3,?4,'reserve',?5,'estimated',?6,?7 WHERE EXISTS(SELECT 1 FROM usage_reservations WHERE id=?2 AND status='reserved')").bind(input.ledgerId,input.id,input.workspaceId,input.userId,input.estimateMicrousd,JSON.stringify({boundary:input.boundary}),input.at),
+    ]);
+    if (!result[0].meta.changes) return {ok:false,code:'usage_budget_exceeded'};
+    return {ok:true,reservation_id:input.id,replay:false};
+  } catch {
+    const raced=await db.prepare('SELECT id,request_hash FROM usage_reservations WHERE workspace_id=?1 AND idempotency_key=?2').bind(input.workspaceId,input.idempotencyKey).first<{id:string;request_hash:string}>();
+    if (raced) return raced.request_hash===input.requestHash ? {ok:true,reservation_id:raced.id,replay:true} : {ok:false,code:'idempotency_conflict'};
+    throw new Error('usage reservation transaction failed');
+  }
 }
 
 export async function usageSummary(db: D1Database, workspaceId: string, at: string) {
   const entitlement = await db.prepare(`SELECT e.status,e.period_start,e.period_end,p.code,p.display_name,p.allowance_microusd FROM workspace_plan_entitlements e JOIN plan_catalogs p ON p.id=e.plan_id WHERE e.workspace_id=?1 AND e.status='active' AND e.period_start<=?2 AND e.period_end>?2 AND p.status='enabled'`).bind(workspaceId,at).first();
   const accounts = await db.prepare('SELECT user_id,allowance_microusd,budget_microusd,reserved_microusd,settled_microusd,period_start,period_end FROM usage_period_accounts WHERE workspace_id=?1 AND period_start<=?2 AND period_end>?2').bind(workspaceId,at).all();
   const ledger = await db.prepare('SELECT kind,amount_microusd,uncertainty,detail,created_at FROM usage_ledger WHERE workspace_id=?1 ORDER BY created_at DESC LIMIT 100').bind(workspaceId).all();
-  const policy = await db.prepare('SELECT monthly_limit_microusd,custom_limit_microusd,upgrade_threshold_percent FROM usage_budget_policies WHERE workspace_id=?1').bind(workspaceId).first();
+  const policy = await db.prepare('SELECT monthly_limit_microusd,custom_limit_microusd,upgrade_threshold_percent,automation_upgrade_threshold FROM usage_budget_policies WHERE workspace_id=?1').bind(workspaceId).first();
   return { billing_status: entitlement ? 'available' : 'billing_unavailable', entitlement: entitlement ?? null, policy: policy ?? null, accounts: accounts.results, ledger: ledger.results, uncertainty: entitlement ? 'estimated_or_verified_only' : 'unknown', blocker: entitlement ? null : { code:'billing_unavailable', message:'No verified billing, pricing, and entitlement evidence is active.' } };
 }
 
