@@ -23,6 +23,9 @@ CREATE TABLE plan_catalogs (
   display_name TEXT NOT NULL,
   allowance_microusd INTEGER NOT NULL CHECK (allowance_microusd >= 0),
   period_kind TEXT NOT NULL CHECK (period_kind IN ('monthly')),
+  assisted_enabled INTEGER NOT NULL DEFAULT 1 CHECK (assisted_enabled IN (0,1)),
+  autopilot_enabled INTEGER NOT NULL DEFAULT 0 CHECK (autopilot_enabled IN (0,1)),
+  automation_upgrade_threshold INTEGER NOT NULL DEFAULT 10 CHECK (automation_upgrade_threshold >= 1),
   billing_evidence_id TEXT NOT NULL REFERENCES billing_evidence(id),
   pricing_evidence_id TEXT NOT NULL REFERENCES billing_evidence(id),
   status TEXT NOT NULL CHECK (status IN ('draft','enabled','retired')),
@@ -58,6 +61,7 @@ CREATE TABLE usage_budget_policies (
   monthly_limit_microusd INTEGER CHECK (monthly_limit_microusd IS NULL OR monthly_limit_microusd >= 0),
   custom_limit_microusd INTEGER CHECK (custom_limit_microusd IS NULL OR custom_limit_microusd >= 0),
   upgrade_threshold_percent INTEGER NOT NULL DEFAULT 20 CHECK (upgrade_threshold_percent IN (10,20) OR (upgrade_threshold_percent BETWEEN 1 AND 99)),
+  automation_upgrade_threshold INTEGER NOT NULL DEFAULT 10 CHECK (automation_upgrade_threshold >= 1),
   updated_by_user_id TEXT NOT NULL REFERENCES users(id),
   updated_at TEXT NOT NULL
 );
