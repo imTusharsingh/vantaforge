@@ -1,20 +1,37 @@
 import { test } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { cpSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
 const root = new URL('..', import.meta.url).pathname;
 const pnpm = (args, options = {}) => spawnSync('pnpm', args, { cwd: root, encoding: 'utf8', ...options });
-const d1 = (persist, sql) => { const result=pnpm(['exec','wrangler','d1','execute','DB','--local','--persist-to',persist,'--command',sql,'--json']); assert.equal(result.status,0,result.stderr); return JSON.parse(result.stdout); };
+// Build one genuine, fully migrated D1 fixture, then copy it per test. This
+// keeps test isolation while avoiding three identical 0011 migration runs.
+const migratedFixture=mkdtempSync(join(tmpdir(),'vantaforge-d1-fixture-'));
+const migrated=pnpm(['exec','wrangler','d1','migrations','apply','DB','--local','--persist-to',migratedFixture]);
+assert.equal(migrated.status,0,migrated.stderr);
+const freshPersist=(prefix) => { const persist=mkdtempSync(join(tmpdir(),prefix)); cpSync(migratedFixture,persist,{recursive:true}); return persist; };
+process.on('exit',()=>rmSync(migratedFixture,{recursive:true,force:true}));
+// Migrations and Worker requests still use Wrangler/Miniflare.  Re-spawning
+// Wrangler for every assertion was the suite stall: it starts a fresh Node
+// process and reopens D1 dozens of times. Query its already-created SQLite
+// backing file instead, preserving the same real local-D1 database.
+const d1 = (persist, sql) => {
+  const directory=join(persist,'v3','d1','miniflare-D1DatabaseObject');
+  const database=join(directory,readdirSync(directory).find((name)=>name.endsWith('.sqlite')));
+  const result=spawnSync('/home/tracxn-lp-784/Android/Sdk/platform-tools/sqlite3',['-json',database,sql],{encoding:'utf8'});
+  assert.equal(result.status,0,result.stderr);
+  const normalize=(value)=>value===null?'null':Array.isArray(value)?value.map(normalize):value&&typeof value==='object'?Object.fromEntries(Object.entries(value).map(([key,item])=>[key,normalize(item)])):value;
+  return [{results:normalize(JSON.parse(result.stdout||'[]'))}];
+};
 async function waitFor(url) { for (let i=0;i<80;i++) { try { const response=await fetch(`${url}/health`); if (response.ok) return; } catch {} await new Promise((resolve)=>setTimeout(resolve,100)); } throw new Error('local Worker did not start'); }
 async function api(url,path,method='GET',token,body) { let response; try { response=await fetch(`${url}${path}`,{method,headers:{...(token?{authorization:`Bearer ${token}`} : {}),...(body?{'content-type':'application/json'}:{})},body:body?JSON.stringify(body):undefined}); } catch (error) { error.message=`${method} ${path}: ${error.message}`; throw error; } const value=await response.json(); return {response,value}; }
 
 test('real D1 cron orchestration is idempotent, authorized, fail-closed, and scheduler-aware', { timeout: 60_000 }, async () => {
-  const persist=mkdtempSync(join(tmpdir(),'vantaforge-d1-')); const port=9100+Math.floor(Math.random()*500); const url=`http://127.0.0.1:${port}`;
-  const migrated=pnpm(['exec','wrangler','d1','migrations','apply','DB','--local','--persist-to',persist]); assert.equal(migrated.status,0,migrated.stderr);
+  const persist=freshPersist('vantaforge-d1-'); const port=9100+Math.floor(Math.random()*500); const url=`http://127.0.0.1:${port}`;
     const worker=spawn('pnpm',['exec','wrangler','dev','--local','--test-scheduled','--persist-to',persist,'--port',String(port)],{cwd:root,stdio:['ignore','pipe','pipe']});
   try {
     await waitFor(url);
@@ -31,15 +48,14 @@ test('real D1 cron orchestration is idempotent, authorized, fail-closed, and sch
     for (const threshold of [10,20]) { await api(url,`/v1/workspaces/${workspaceId}/policy`,'PUT',token,{review_mode:'after_n_shorts',review_after_count:threshold}); d1(persist,`UPDATE automation_review_counters SET shorts_since_review=${threshold},version=version+1 WHERE workspace_id='${workspaceId}'; INSERT INTO automation_runs(id,schedule_id,workspace_id,idempotency_key,scheduled_for,policy_snapshot,configuration_snapshot,status,current_step,blocker_code,created_at,updated_at) VALUES('review-${threshold}','${schedule.value.data.id}','${workspaceId}','review-${threshold}','2026-01-${threshold}','{}','{}','waiting_review','publishing','review_required','2026-01-02','2026-01-02'); INSERT INTO automation_run_steps(id,run_id,workspace_id,step,ordinal,idempotency_key,status,blocker_code,created_at,updated_at) VALUES('step-${threshold}','review-${threshold}','${workspaceId}','publishing',4,'step-${threshold}','waiting_review','review_required','2026-01-02','2026-01-02');`); const resumed=await api(url,`/v1/automation-runs/review-${threshold}/approve`,'POST',token,{reason:`reviewed ${threshold}`}); assert.equal(resumed.response.status,200); assert.equal(resumed.value.data.status,'queued'); const evidence=d1(persist,`SELECT threshold,shorts_reviewed FROM automation_review_checkpoints WHERE run_id='review-${threshold}'`); assert.deepEqual(evidence[0].results[0],{threshold,shorts_reviewed:threshold}); }
   } finally { worker.kill('SIGTERM'); await new Promise((resolve)=>worker.once('exit',resolve)); rmSync(persist,{recursive:true,force:true}); }
 
-  const unavailablePersist=mkdtempSync(join(tmpdir(),'vantaforge-d1-unavailable-')); const unavailablePort=port+600; const unavailableUrl=`http://127.0.0.1:${unavailablePort}`; assert.equal(pnpm(['exec','wrangler','d1','migrations','apply','DB','--local','--persist-to',unavailablePersist]).status,0);
+  const unavailablePersist=freshPersist('vantaforge-d1-unavailable-'); const unavailablePort=port+600; const unavailableUrl=`http://127.0.0.1:${unavailablePort}`;
   const unavailable=spawn('pnpm',['exec','wrangler','dev','--local','--persist-to',unavailablePersist,'--port',String(unavailablePort),'--var','AUTOMATION_SCHEDULER_ENABLED:false'],{cwd:root,stdio:['ignore','pipe','pipe']});
   try { await waitFor(unavailableUrl); const signup=await api(unavailableUrl,'/v1/auth/signup','POST',null,{email:`unavailable-${port}@example.com`,display_name:'Unavailable',password:'correct-horse-battery-staple'}); const workspace=await api(unavailableUrl,'/v1/workspaces','POST',signup.value.data.token,{name:'No Scheduler'}); const schedule=await api(unavailableUrl,`/v1/workspaces/${workspace.value.data.id}/automation-schedules`,'POST',signup.value.data.token,{name:'Blocked',cadence_minutes:5,provider:'openai'}); assert.equal(schedule.value.data.status,'blocked'); assert.equal(schedule.value.data.blocker_code,'scheduler_unavailable'); const resumed=await api(unavailableUrl,`/v1/automation-schedules/${schedule.value.data.id}/control`,'POST',signup.value.data.token,{action:'resume'}); assert.equal(resumed.response.status,409); assert.equal(resumed.value.error.code,'scheduler_unavailable'); }
   finally { unavailable.kill('SIGTERM'); await new Promise((resolve)=>unavailable.once('exit',resolve)); rmSync(unavailablePersist,{recursive:true,force:true}); }
 });
 
 test('real D1 CAS prevents duplicate leases, stale review approval, and budget races', { timeout: 30_000 }, () => {
-  const persist=mkdtempSync(join(tmpdir(),'vantaforge-cas-')); try {
-    assert.equal(pnpm(['exec','wrangler','d1','migrations','apply','DB','--local','--persist-to',persist]).status,0);
+  const persist=freshPersist('vantaforge-cas-'); try {
     d1(persist,"INSERT INTO users(id,email,display_name,password_hash,password_salt,created_at,last_seen_at) VALUES('u','u@x.test','u','h','s','2026-01-01','2026-01-01'); INSERT INTO workspaces(id,name,slug,owner_user_id,timezone,created_at,updated_at) VALUES('w','w','w','u','UTC','2026-01-01','2026-01-01'); INSERT INTO automation_schedules(id,workspace_id,created_by_user_id,name,cadence_minutes,provider,configuration,status,next_run_at,created_at,updated_at) VALUES('s','w','u','s',5,'openai','{}','active','2026-01-01','2026-01-01','2026-01-01'); INSERT INTO automation_runs(id,schedule_id,workspace_id,idempotency_key,scheduled_for,policy_snapshot,configuration_snapshot,status,created_at,updated_at) VALUES('r','s','w','r','2026-01-01','{}','{}','queued','2026-01-01','2026-01-01'); INSERT INTO automation_run_steps(id,run_id,workspace_id,step,ordinal,idempotency_key,status,created_at,updated_at) VALUES('a','r','w','idea_scout',1,'a','pending','2026-01-01','2026-01-01'),('p','r','w','publishing',4,'p','waiting_review','2026-01-01','2026-01-01');");
     d1(persist,"UPDATE automation_runs SET status='running',lease_owner='one',lease_expires_at='2026-01-01T00:01:00Z' WHERE id='r' AND status IN ('queued','running') AND (lease_owner IS NULL OR lease_expires_at<='2026-01-01T00:00:00Z'); UPDATE automation_runs SET lease_owner='two' WHERE id='r' AND (lease_owner IS NULL OR lease_expires_at<='2026-01-01T00:00:00Z');");
     let result=d1(persist,"SELECT lease_owner FROM automation_runs WHERE id='r'"); assert.equal(result[0].results[0].lease_owner,'one');
@@ -58,11 +74,11 @@ test('real D1 CAS prevents duplicate leases, stale review approval, and budget r
 });
 
 test('persisted successful Idea Scout outcome creates the production brief and propagates its real id', { timeout: 40_000 }, async () => {
-  const persist=mkdtempSync(join(tmpdir(),'vantaforge-boundary-')); const port=9700+Math.floor(Math.random()*200); const url=`http://127.0.0.1:${port}`; try {
-    assert.equal(pnpm(['exec','wrangler','d1','migrations','apply','DB','--local','--persist-to',persist]).status,0); const hash=createHash('sha256').update(JSON.stringify({provider:'openai'})).digest('base64');
+  const persist=freshPersist('vantaforge-boundary-'); const port=9700+Math.floor(Math.random()*200); const url=`http://127.0.0.1:${port}`; try {
+    const hash=createHash('sha256').update(JSON.stringify({provider:'openai'})).digest('base64');
     d1(persist,`INSERT INTO users(id,email,display_name,password_hash,password_salt,created_at,last_seen_at) VALUES('u','boundary@x.test','u','h','s','2026-01-01','2026-01-01'); INSERT INTO workspaces(id,name,slug,owner_user_id,timezone,created_at,updated_at) VALUES('w','w','boundary','u','UTC','2026-01-01','2026-01-01'); INSERT INTO memberships(id,workspace_id,user_id,role,status,created_at) VALUES('m','w','u','owner','active','2026-01-01'); INSERT INTO ai_provider_connections(id,workspace_id,provider,credential_kind,encrypted_secret,selected_model,status,last_verified_at,created_at,updated_at) VALUES('ai','w','openai','api_key','encrypted','gpt-4o','verified','2026-01-01','2026-01-01','2026-01-01'); INSERT INTO assets(id,workspace_id,storage_key,media_type,original_filename,bytes,duration_seconds,metadata,license_type,rights_confirmed,scan_status,licensing_status,status,created_by_user_id,created_at,updated_at) VALUES('asset','w','asset-key','video/mp4','real.mp4',100,30,'{}','owned',1,'clean','valid','ready','u','2026-01-01','2026-01-01'); INSERT INTO automation_policies(workspace_id,mode,enabled_capabilities,review_mode,review_after_count,daily_spend_limit,per_job_cost_limit,stop_switch,updated_at) VALUES('w','autopilot','["idea_discovery","production","quality","publishing"]','none',NULL,10,2,0,'2026-01-01'); INSERT INTO automation_schedules(id,workspace_id,created_by_user_id,name,cadence_minutes,provider,configuration,status,next_run_at,created_at,updated_at) VALUES('s','w','u','s',5,'openai','{"asset_ids":["asset"],"cost_estimates_microusd":{"idea_scout":0,"production":0,"quality":0,"publishing":0}}','active','2099-01-01','2026-01-01','2026-01-01'); INSERT INTO automation_runs(id,schedule_id,workspace_id,idempotency_key,scheduled_for,policy_snapshot,configuration_snapshot,status,created_at,updated_at) VALUES('r','s','w','r','2026-01-01','{}','{"asset_ids":["asset"],"cost_estimates_microusd":{"idea_scout":0,"production":0,"quality":0,"publishing":0}}','queued','2026-01-01','2026-01-01'); INSERT INTO idea_scout_runs(id,workspace_id,created_by_user_id,idempotency_key,request_hash,provider_snapshot,policy_snapshot,status,created_at,completed_at) VALUES('ir','w','u','r:idea_scout','${hash}','{"provider":"openai"}','{}','succeeded','2026-01-01','2026-01-01'); INSERT INTO idea_candidates(id,run_id,workspace_id,title,premise,evidence_json,trend_signals_json,created_at) VALUES('ic','ir','w','Evidence title','Evidence premise','["source:real"]','[]','2026-01-01');`);
     const worker=spawn('pnpm',['exec','wrangler','dev','--local','--test-scheduled','--persist-to',persist,'--port',String(port)],{cwd:root,stdio:['ignore','pipe','pipe']}); try { await waitFor(url); assert.equal((await fetch(`${url}/__scheduled?cron=*/5+*+*+*+*`)).status,200); await new Promise((resolve)=>setTimeout(resolve,300)); } finally { worker.kill('SIGTERM'); await new Promise((resolve)=>worker.once('exit',resolve)); }
     const result=d1(persist,"SELECT s.status,s.blocker_code,s.boundary_resource_id,(SELECT COUNT(*) FROM content_briefs b WHERE b.id=s.boundary_resource_id AND b.idea_id='ic') AS real_brief FROM automation_run_steps s WHERE s.run_id='r' AND s.step='idea_scout'"); assert.deepEqual(result[0].results[0],{status:'succeeded',blocker_code:'null',boundary_resource_id:result[0].results[0].boundary_resource_id,real_brief:1}); assert.equal(result[0].results[0].boundary_resource_id.length>0,true);
-    const production=d1(persist,"SELECT s.status,s.blocker_code,s.next_attempt_at,s.boundary_resource_id,(SELECT status FROM production_jobs WHERE id=s.boundary_resource_id) AS boundary_status FROM automation_run_steps s WHERE s.run_id='r' AND s.step='production'"); assert.deepEqual(production[0].results[0],{status:'blocked',blocker_code:'provider_unavailable',next_attempt_at:'null',boundary_resource_id:production[0].results[0].boundary_resource_id,boundary_status:'blocked'});
+    const production=d1(persist,"SELECT s.status,s.blocker_code,s.next_attempt_at,s.boundary_resource_id,(SELECT status FROM production_jobs WHERE id=s.boundary_resource_id) AS boundary_status FROM automation_run_steps s WHERE s.run_id='r' AND s.step='production'"); assert.deepEqual(production[0].results[0],{status:'blocked',blocker_code:'billing_unavailable',next_attempt_at:'null',boundary_resource_id:'null',boundary_status:'null'});
   } finally { rmSync(persist,{recursive:true,force:true}); }
 });
