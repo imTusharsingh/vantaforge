@@ -8,6 +8,7 @@ import { evaluateDeterministicQuality, qualityScore, type QualityAsset, type Qua
 import { ANALYTICS_SCOPES, oauthAuthorizationUrl, PLATFORM_RULES, publicConnection, retryDelaySeconds, validatePublishPayload, type PublishingPlatform } from "./publishing";
 import { analyticsBlocker, normalizeInstagramMetrics, normalizeYouTubeRows, suggestionEvidence, type AnalyticsPlatform, type NormalizedMetric } from "./analytics";
 import { AUTOMATION_STEPS, MAX_AUTOMATION_ATTEMPTS, policyBlocker, retryableAutomationCode, retryDelaySeconds as automationRetryDelay, terminalState, type AutomationPolicy, type AutomationStep } from './automation';
+import { reserveUsage, usageSummary } from './usage';
 
 export interface Env { DB: D1Database; ASSETS?: R2Bucket; AUTOMATION_SCHEDULER_ENABLED?: string; ALLOWED_ORIGIN?: string; CREDENTIAL_ENCRYPTION_KEY?: string; PUBLIC_BASE_URL?: string; PUBLIC_MEDIA_BASE_URL?: string; YOUTUBE_CLIENT_ID?: string; YOUTUBE_CLIENT_SECRET?: string; INSTAGRAM_CLIENT_ID?: string; INSTAGRAM_CLIENT_SECRET?: string }
 type User = { id: string; email: string; display_name: string; status: string };
@@ -100,6 +101,11 @@ async function policy(request: Request, db: D1Database, auth: Auth, id: string) 
   await db.prepare("UPDATE automation_policies SET mode=?1, enabled_capabilities=?2, review_mode=?3, review_after_count=?4, daily_spend_limit=?5, per_job_cost_limit=?6, stop_switch=?7, version=version+1, updated_at=?8 WHERE workspace_id=?9").bind(next.mode, JSON.stringify(next.enabled), next.review, next.after, next.daily, next.perJob, next.stop ? 1 : 0, now(), id).run();
   if (next.stop || next.enabled.length === 0) await cancelEligibleAutomationRuns(db,id,next.stop ? 'stop_switch_enabled' : 'automation_disabled',now());
   return json({ data: await db.prepare("SELECT * FROM automation_policies WHERE workspace_id=?1").bind(id).first() });
+}
+
+async function workspaceUsage(request: Request, db: D1Database, auth: Auth, workspaceId: string) {
+  await providerAccess(request, db, auth, workspaceId);
+  return json({ data: await usageSummary(db, workspaceId, now()) });
 }
 
 type ProviderConnection = { id: string; workspace_id: string; provider: string; credential_kind: string; encrypted_secret: string | null; selected_model: string | null; status: string; last_verified_at: string | null; last_error_code: string | null; created_at: string; updated_at: string };
@@ -337,7 +343,7 @@ async function revokePublishingConnection(request: Request, db: D1Database, auth
   await db.prepare("UPDATE publishing_connections SET encrypted_access_token=NULL,encrypted_refresh_token=NULL,credential_status='revoked',last_error_code=NULL,updated_at=?1 WHERE id=?2").bind(now(), id).run(); return json({ data: { id, credential_status: "revoked" } });
 }
 
-type PublishRequestRow = { id: string; workspace_id: string; production_job_id: string; quality_gate_run_id: string; connection_id: string; asset_id: string; scheduled_for: string; idempotency_key: string; payload: string; platform_payload_hash: string; status: string; attempts: number; next_attempt_at: string | null; last_error_code: string | null; last_error_message: string | null; created_at: string; updated_at: string };
+type PublishRequestRow = { id: string; workspace_id: string; production_job_id: string; quality_gate_run_id: string; connection_id: string; asset_id: string; scheduled_for: string; idempotency_key: string; payload: string; platform_payload_hash: string; status: string; attempts: number; next_attempt_at: string | null; last_error_code: string | null; last_error_message: string | null; created_by_user_id: string; created_at: string; updated_at: string };
 function publicPublishRequest(row: PublishRequestRow) { return { ...row, payload: JSON.parse(row.payload) }; }
 
 async function createPublishRequest(request: Request, db: D1Database, auth: Auth, workspaceId: string) {
@@ -366,6 +372,11 @@ async function performYouTubeUpload(env: Env, connection: PublishingConnection, 
 
 async function attemptPublish(request: Request, db: D1Database, auth: Auth, env: Env, id: string) {
   const publish = await db.prepare("SELECT * FROM publish_requests WHERE id=?1").bind(id).first<PublishRequestRow>(); if (!publish) throw new HttpError(404, "publish_request_not_found", "Publish request not found"); await providerAccess(request, db, auth, publish.workspace_id); if (!["queued", "retry_scheduled"].includes(publish.status) || (publish.next_attempt_at && publish.next_attempt_at > now())) throw new HttpError(409, "publish_not_due", "The publish request is not due");
+  // Platform upload is the real chargeable side effect. There is no verified
+  // platform pricing evidence in this deployment, so reserveUsage fails closed
+  // instead of sending a provider request with a fictional price.
+  const timestamp = now(); const reservation = await reserveUsage(db, { workspaceId: publish.workspace_id, userId: publish.created_by_user_id, boundary: 'publish', idempotencyKey: `publish:${publish.id}`, requestHash: publish.platform_payload_hash, estimateMicrousd: 0, at: timestamp, id: randomId(), ledgerId: randomId() });
+  if (!reservation.ok) { await db.prepare("UPDATE publish_requests SET status='blocked',last_error_code=?1,last_error_message=?2,updated_at=?3 WHERE id=?4").bind(reservation.code, 'Publishing is blocked until verified billing, pricing, entitlement, and cost evidence are available', timestamp, id).run(); throw new HttpError(409, reservation.code, 'Publishing is blocked before the platform call'); }
   const connection = await db.prepare(`${publishingConnectionSelect} WHERE id=?1`).bind(publish.connection_id).first<PublishingConnection>(); if (!connection) throw new HttpError(409, "publishing_connection_not_found", "Publishing connection no longer exists"); const payload = JSON.parse(publish.payload) as { platform: PublishingPlatform; title: string; description: string; tags: string[]; scheduled_for: string };
   if (payload.platform === "instagram") { await db.prepare("UPDATE publish_requests SET status='blocked',last_error_code='media_upload_unavailable',last_error_message='Instagram Graph API requires a publicly reachable media URL; the asset store is private and no official media delivery capability is configured',updated_at=?1 WHERE id=?2").bind(now(), id).run(); throw new HttpError(409, "media_upload_unavailable", "Instagram publishing is blocked until an official public media delivery capability is configured"); }
   if (!env.CREDENTIAL_ENCRYPTION_KEY || !connection.encrypted_access_token) throw new HttpError(409, "credential_required", "The publishing credential is unavailable"); if (connection.access_expires_at && connection.access_expires_at <= now()) { await db.prepare("UPDATE publishing_connections SET credential_status='expired',last_error_code='connection_expired',updated_at=?1 WHERE id=?2").bind(now(), connection.id).run(); throw new HttpError(409, "connection_expired", "The publishing access token has expired"); }
@@ -544,11 +555,15 @@ async function createProduction(request: Request, db: D1Database, auth: Auth, wo
   if (!approved) throw new HttpError(422,'brief_not_approved','An approved workspace brief is required');
   const policy = await db.prepare('SELECT * FROM automation_policies WHERE workspace_id=?1').bind(workspaceId).first<Record<string, unknown>>();
   if (!policy) throw new HttpError(409,'policy_not_found','Automation policy not found');
+  // The render adapter is a chargeable provider boundary. With no verified
+  // billing/pricing/entitlement evidence, stop here before it can be called.
+  const billing = await usageSummary(db, workspaceId, now());
   const connection = await connectionFor(db,workspaceId,provider);
   const snapshot = { provider, model: connection?.selected_model ?? null, verified_at: connection?.last_verified_at ?? null };
   let blocker: string | null = null;
   let enabled: unknown; try { enabled = JSON.parse(String(policy.enabled_capabilities)); } catch { enabled = null; }
   if (member.status !== 'active' || policy.stop_switch || !Array.isArray(enabled) || !enabled.includes('production')) blocker = 'policy_blocked';
+  if (!blocker && billing.billing_status === 'billing_unavailable') blocker = 'billing_unavailable';
   for (const assetId of assetIds) {
     const asset = await db.prepare('SELECT status,scan_status,licensing_status,rights_confirmed,license_type FROM assets WHERE id=?1 AND workspace_id=?2').bind(assetId,workspaceId).first<{status:string;scan_status:string;licensing_status:string;rights_confirmed:number;license_type:string | null}>();
     if (!asset) throw new HttpError(422,'asset_not_found','A selected asset does not belong to this workspace');
@@ -725,6 +740,7 @@ export default { async scheduled(_controller: ScheduledController, env: Env): Pr
     if (path === "/v1/auth/logout" && request.method === "POST") { await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?1").bind(await sha256(auth.token)).run(); return json({ data: { logged_out: true } }, 200, headers); }
     if (path === "/v1/workspaces" && request.method === "GET") return json({ data: await env.DB.prepare("SELECT w.*, m.role FROM workspaces w JOIN memberships m ON m.workspace_id=w.id WHERE m.user_id=?1 AND m.status='active' ORDER BY w.created_at DESC").bind(auth.user.id).all() }, 200, headers);
     if (path === "/v1/workspaces" && request.method === "POST") return await createWorkspace(request, env.DB, auth);
+    const usageMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/usage$/); if (usageMatch && request.method === 'GET') return await workspaceUsage(request, env.DB, auth, usageMatch[1]);
     const schedulesMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/automation-schedules$/); if (schedulesMatch && ['GET','POST'].includes(request.method)) return await automationSchedules(request,env.DB,auth,env,schedulesMatch[1]);
     const scheduleControlMatch = path.match(/^\/v1\/automation-schedules\/([^/]+)\/control$/); if (scheduleControlMatch && request.method === 'POST') return await controlAutomationSchedule(request,env.DB,auth,env,scheduleControlMatch[1]);
     const automationRunsMatch = path.match(/^\/v1\/workspaces\/([^/]+)\/automation-runs$/); if (automationRunsMatch && request.method === 'GET') return await automationRuns(request,env.DB,auth,automationRunsMatch[1]);
